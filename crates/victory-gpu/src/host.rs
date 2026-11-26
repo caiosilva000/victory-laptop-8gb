@@ -1237,6 +1237,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// The window of indirect draws clamped together (`crate::indirect`,
+    /// `VICTORY_CLAMP_WINDOW=1`).
+    clamp_window: Mutex<crate::indirect::Window>,
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
@@ -4134,6 +4137,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                clamp_window: Mutex::default(),
                 batch_args: Mutex::default(),
                 gather: Mutex::default(),
                 coming: Mutex::default(),
@@ -6223,6 +6227,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        crate::indirect::end_window(self);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6281,6 +6286,7 @@ impl HostList {
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
+        crate::indirect::forget_windows(self);
         *self.gather.lock().unwrap_or_else(|e| e.into_inner()) = GatherPrelude::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7301,6 +7307,11 @@ impl HostList {
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
+    }
+
+    /// The list's window of indirect draws clamped together (`VICTORY_CLAMP_WINDOW=1`).
+    pub(crate) fn clamp_window(&self) -> std::sync::MutexGuard<'_, crate::indirect::Window> {
+        self.clamp_window.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps `object` alive until the list is reset.

@@ -413,9 +413,15 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    end_window(list);
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, &budget, src, count, spec, false).then_some(dst)
+    let ok = clamp_into(list, c, &dst, &budget, src, count, spec, false);
+    #[cfg(feature = "diagnostics")]
+    if ok {
+        crate::copystat::add(crate::copystat::C::ClampSingle, 1);
+    }
+    ok.then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -433,9 +439,15 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    end_window(list);
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, &budget, src, None, spec, true).then_some(dst)
+    let ok = clamp_into(list, c, &dst, &budget, src, None, spec, true);
+    #[cfg(feature = "diagnostics")]
+    if ok {
+        crate::copystat::add(crate::copystat::C::ClampSteppedWindows, 1);
+    }
+    ok.then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -717,8 +729,12 @@ pub(crate) fn bound_before(
     let (c, budget) = (clamp()?, h.clamps.budget()?);
     let (buffer, at) = h.room(bytes)?;
     let list = &h.clamps.list;
-    record_clamp_full(c, list, (&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), Some(at), &budget, src, count, spec, false)
-        .then_some((buffer, at))
+    let ok = record_clamp_full(c, list, (&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), Some(at), &budget, src, count, spec, false);
+    #[cfg(feature = "diagnostics")]
+    if ok {
+        crate::copystat::add(crate::copystat::C::ClampHoisted, 1);
+    }
+    ok.then_some((buffer, at))
 }
 
 /// The batched clamp's pipeline ([`batch`]).
@@ -749,6 +765,7 @@ pub(crate) fn open_batch(
     source: (u64, &ID3D12Resource),
     recent: &[(u64, ID3D12Resource)],
 ) -> Option<(batch::Table, ID3D12Resource)> {
+    end_window(list);
     let (table, pass) = prepare_batch(list, source, recent, false)?;
     pass.record(&list.list);
     Some((table, pass.dst))
@@ -766,7 +783,10 @@ pub(crate) struct BatchPass {
 impl BatchPass {
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+        {
+            crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+            crate::copystat::add(crate::copystat::C::ClampBatched, 1);
+        }
         batch::record(self.clamp, list, (&self.dst, self.before), self.budget, self.sources, self.jobs);
     }
 }
@@ -821,6 +841,349 @@ pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12R
 fn global_clamp_waits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAITS").is_none_or(|v| v != "0"))
+}
+
+fn clamp_window_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_some_and(|v| v == "1")
+}
+
+/// Whether consecutive non-storing indirect draws are clamped together in a
+/// single pass (`VICTORY_CLAMP_WINDOW=1`; off by default, ported from
+/// Marvisak/VIctory PR #3197).
+pub(crate) fn windows_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| clamp_window_from(std::env::var_os("VICTORY_CLAMP_WINDOW").as_deref()))
+}
+
+/// Draws a clamp window's table holds at most.
+const WINDOW_ENTRIES: u32 = 64;
+/// Bytes of clamped records a clamp window holds at most.
+const WINDOW_BYTES: u64 = 1 << 16;
+/// Records a clamp window clamps at most.
+const WINDOW_RECORDS: u32 = 4096;
+/// Host copies a clamp window's pass can read records from.
+const WINDOW_SOURCES: usize = 4;
+/// A table: a header of 4 words, then 8 words per draw.
+const TABLE_BYTES: u64 = 16 + 32 * WINDOW_ENTRIES as u64;
+
+const WINDOW_SOURCE: &str = r#"
+#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u1), UAV(u0)"
+// The host copies records are read from, only read.
+ByteAddressBuffer a0 : register(t0);
+ByteAddressBuffer a1 : register(t1);
+ByteAddressBuffer a2 : register(t2);
+ByteAddressBuffer a3 : register(t3);
+// Records, draws; then per draw (at 16 + 32 * draw) its first record in the
+// window, records, kind, stride, source, the records' offset in it, their
+// offset in `dest`. Draws in order; none without records.
+ByteAddressBuffer table : register(t4);
+RWByteAddressBuffer dest : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint MOST_DRAW = 1u << 23;
+static const uint GROUPS = 1u << 20;
+uint word(uint source, uint at) {
+    [branch] if (source == 0) {
+        return a0.Load(at);
+    }
+    [branch] if (source == 1) {
+        return a1.Load(at);
+    }
+    [branch] if (source == 2) {
+        return a2.Load(at);
+    }
+    return a3.Load(at);
+}
+// The single clamp's bounds (`SOURCE`), word for word: the record of `kind`
+// (`stride` bytes) at `from` in `source` clamped into `dest` at `to`; its cost.
+uint clamped(uint kind, uint stride, uint source, uint from, uint to) {
+    uint cost;
+    if (kind <= 1) {
+        uint2 want = uint2(word(source, from), word(source, from + 4));
+        if (want.x >= MOST_DRAW) {
+            want = uint2(0, 0);
+        }
+        uint count = want.x;
+        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        dest.Store2(to, uint2(count, instances));
+        for (uint off = 8; off < stride; off += 4) {
+            dest.Store(to + off, word(source, from + off));
+        }
+    } else if (kind == 2) {
+        uint3 g = uint3(word(source, from), word(source, from + 4), word(source, from + 8));
+        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        dest.Store3(to, g);
+        for (uint off = 12; off < stride; off += 4) {
+            dest.Store(to + off, word(source, from + off));
+        }
+    } else {
+        uint3 g = uint3(word(source, from), word(source, from + 4), word(source, from + 8));
+        if (g.x > 65535u) {
+            g = uint3(0, 0, 0);
+        }
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128u;
+        dest.Store3(to, g);
+        for (uint off = 12; off < stride; off += 4) {
+            dest.Store(to + off, word(source, from + off));
+        }
+    }
+    return cost;
+}
+static const uint PAST = 0xffffffffu;
+groupshared uint costs[64];
+// One group, tiles of 64 records, the first lane charges each tile's records
+// in order, matching `SOURCE`'s budget semantics.
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint records = table.Load(0);
+    uint draws = min(table.Load(4), 64u);
+    uint left = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
+        uint record = tile * 64 + lane;
+        uint cost = 0;
+        uint to = 0;
+        uint kind = 0;
+        if (record < records) {
+            uint draw = 0;
+            for (uint k = 1; k < draws; k++) {
+                if (table.Load(16 + 32 * k) <= record) {
+                    draw = k;
+                }
+            }
+            uint4 head = table.Load4(16 + 32 * draw);
+            uint3 place = table.Load3(32 + 32 * draw);
+            uint index = record - head.x;
+            kind = head.z;
+            to = place.z + index * head.w;
+            cost = clamped(kind, head.w, place.x, place.y + index * head.w, to);
+        }
+        costs[lane] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0) {
+            for (uint i = 0; i < 64; i++) {
+                uint c = costs[i];
+                if (c > 0) {
+                    if (c > left) {
+                        costs[i] = PAST;
+                        if (REST) {
+                            left = 0;
+                        }
+                    } else {
+                        left -= c;
+                    }
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (costs[lane] == PAST) {
+            if (kind <= 1) {
+                dest.Store2(to, uint2(0, 0));
+            } else {
+                dest.Store3(to, uint3(0, 0, 0));
+            }
+        }
+    }
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
+    }
+}
+"#;
+
+fn window_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, WINDOW_SOURCE));
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no windowed argument clamp: each indirect draw clamped on its own");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Whether a clamp window was ever opened: until then (always, with the switch
+/// off) ending and forgetting windows takes no lock.
+static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The clamp window a list has open, and the host copies its windows read.
+#[derive(Default)]
+pub(crate) struct Window {
+    open: Option<Open>,
+    /// Host GPU addresses of copies earlier windows of the list read
+    /// (newest first): the next window's pass gets views of them too. The
+    /// list's `keep` holds those copies until it is reset.
+    recent: Vec<u64>,
+}
+
+struct Open {
+    /// The list's scratch buffer, in `INDIRECT_ARGUMENT` until the next clamp
+    /// or list close (`HostList::indirect_common`).
+    out: ID3D12Resource,
+    /// The table's CPU address (upload memory of the list).
+    table: usize,
+    /// The copies the pass reads: host GPU addresses, t0 to t3.
+    sources: Vec<u64>,
+    draws: u32,
+    records: u32,
+    bytes: u64,
+}
+
+/// Ends `list`'s clamp window, if one is open. Before any command that may
+/// write buffers or reuse the scratch buffer.
+pub(crate) fn end_window(list: &HostList) {
+    if !OPENED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _ = list.clamp_window().open.take();
+}
+
+/// Forgets `list`'s clamp windows (it was reset).
+pub(crate) fn forget_windows(list: &HostList) {
+    if OPENED.load(std::sync::atomic::Ordering::Relaxed) {
+        *list.clamp_window() = Window::default();
+    }
+}
+
+/// The clamped records of an indirect draw of `records` records of `kind`
+/// `stride` bytes apart, `offset` bytes into the host copy at host GPU
+/// address `source`, in `list`'s open clamp window, or in one opened for it:
+/// the scratch buffer, the records' offset in it, and whether a window was
+/// opened (its pass replaced the list's compute root signature and pipeline).
+/// `None` if the draw cannot be clamped in a window.
+pub(crate) fn windowed(
+    list: &HostList,
+    source: u64,
+    offset: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64, bool)> {
+    let min = min_stride(kind)?;
+    let bytes = u64::from(stride).checked_mul(u64::from(records.max(1)))?;
+    if stride < min
+        || !source.is_multiple_of(4)
+        || !offset.is_multiple_of(4)
+        || !stride.is_multiple_of(4)
+        || records > WINDOW_RECORDS
+        || bytes > WINDOW_BYTES
+        || offset.checked_add(bytes)? > u64::from(u32::MAX)
+    {
+        return None;
+    }
+    let mut window = list.clamp_window();
+    let mut opened = false;
+    if !window.open.as_ref().is_some_and(|o| o.fits(source, bytes, records)) {
+        let _ = window.open.take();
+        let mut sources = vec![source];
+        sources.extend(window.recent.iter().copied().filter(|&s| s != source).take(WINDOW_SOURCES - 1));
+        window.recent.clone_from(&sources);
+        OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
+        window.open = Some(open(list, sources)?);
+        opened = true;
+    }
+    let o = window.open.as_mut()?;
+    let at = o.bytes;
+    if records > 0 {
+        let index = o.sources.iter().position(|&s| s == source)? as u32;
+        let entry = [o.records, records, kind, stride, index, offset as u32, at as u32, 0];
+        // SAFETY: the table's words lie in the list's upload memory, alive
+        // until it is reset; the GPU reads them only once the list runs.
+        unsafe {
+            let table = o.table as *mut u32;
+            for (k, &w) in entry.iter().enumerate() {
+                table.add(4 + 8 * o.draws as usize + k).write_volatile(w);
+            }
+            o.draws += 1;
+            o.records += records;
+            table.write_volatile(o.records);
+            table.add(1).write_volatile(o.draws);
+        }
+    }
+    o.bytes += bytes;
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::ClampWindowDraws, 1);
+        if opened {
+            crate::copystat::add(crate::copystat::C::ClampWindows, 1);
+        }
+    }
+    Some((o.out.clone(), at, opened))
+}
+
+impl Open {
+    /// Whether a draw of `records` records (`bytes` bytes) in the copy at
+    /// `source` joins the window.
+    fn fits(&self, source: u64, bytes: u64, records: u32) -> bool {
+        self.draws < WINDOW_ENTRIES
+            && self.bytes + bytes <= WINDOW_BYTES
+            && self.records + records <= WINDOW_RECORDS
+            && self.sources.contains(&source)
+    }
+}
+
+/// Whether an indirect draw (as [`windowed`] takes it) joins `list`'s open
+/// clamp window (tests: to read a window's records before the next one).
+#[cfg(test)]
+fn joins(list: &HostList, source: u64, (_, stride, records): (u32, u32, u32)) -> bool {
+    let bytes = u64::from(stride) * u64::from(records.max(1));
+    list.clamp_window().open.as_ref().is_some_and(|o| o.fits(source, bytes, records))
+}
+
+/// Records a clamp window's pass in `list`, reading records from `sources`.
+fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
+    let (Some(c), Some(budget)) = (window_clamp(), list.budget()) else {
+        return None;
+    };
+    let out = list.indirect_scratch(WINDOW_BYTES)?;
+    let before = list.indirect_state(&out);
+    let (table_gpu, table) = list.scratch(TABLE_BYTES)?;
+    // SAFETY: the header of the list's fresh upload memory.
+    unsafe { std::ptr::write_bytes(table, 0, 16) };
+    let l = &list.list;
+    let global_wait = global_clamp_waits();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    // SAFETY: an open list; our root signature, pipeline and buffers, and
+    // host copies kept alive by the list.
+    unsafe {
+        let budget_gpu = budget.GetGPUVirtualAddress();
+        // Earlier shader writes (the title's argument passes) first.
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(&out, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        ]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        for k in 0..WINDOW_SOURCES {
+            l.SetComputeRootShaderResourceView(k as u32, *sources.get(k).unwrap_or(&sources[0]));
+        }
+        l.SetComputeRootShaderResourceView(4, table_gpu);
+        l.SetComputeRootUnorderedAccessView(5, budget_gpu);
+        l.SetComputeRootUnorderedAccessView(6, out.GetGPUVirtualAddress());
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[
+            if global_wait {
+                uav_barrier()
+            } else {
+                resource_uav_barrier(Some(&budget))
+            },
+            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        ]);
+    }
+    list.indirect_readable(&out);
+    Some(Open { out, table: table as usize, sources, draws: 0, records: 0, bytes: 0 })
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -3069,6 +3432,335 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert!(hoisting_from(Some(OsStr::new("1"))));
         if std::env::var_os("VICTORY_HOIST_CLAMPS").as_deref() != Some(OsStr::new("1")) {
             assert!(!hoisting(), "hoisting stays off unless VICTORY_HOIST_CLAMPS=1");
+        }
+    }
+
+    /// When `VICTORY_CLAMP_WINDOW` is unset (or not `"1"`), clamp windows stay
+    /// off and the existing inline clamp path (`bound`) runs without opening
+    /// any clamp window.
+    #[test]
+    fn clamp_window_switch_is_off_by_default_and_preserves_old_path() {
+        use std::ffi::OsStr;
+        assert!(!clamp_window_from(None), "unset keeps the existing clamp path");
+        assert!(!clamp_window_from(Some(OsStr::new("0"))));
+        assert!(!clamp_window_from(Some(OsStr::new(""))));
+        assert!(!clamp_window_from(Some(OsStr::new("true"))));
+        assert!(clamp_window_from(Some(OsStr::new("1"))));
+        if std::env::var_os("VICTORY_CLAMP_WINDOW").as_deref() != Some(OsStr::new("1")) {
+            assert!(!windows_on(), "clamp windows stay off unless VICTORY_CLAMP_WINDOW=1");
+        }
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src, src_ptr)) = host.shared_buffer(64) else {
+            return;
+        };
+        // SAFETY: mapped buffer of 64 bytes; nothing runs yet.
+        unsafe {
+            let words = [3u32, 1, 1];
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), src_ptr, words.len() * 4);
+        }
+        let out = bound(&list, (&src, 0), None, (10, 12, 1)).expect("inline bound still works");
+        assert!(list.clamp_window().open.is_none(), "old inline path opens no clamp window");
+        assert_eq!(list.indirect_state(&out), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list.close();
+        assert_eq!(list.indirect_state(&out), D3D12_RESOURCE_STATE_COMMON);
+    }
+
+    /// What a clamp-window test list records, in order.
+    #[derive(Clone, Copy)]
+    enum WindowStep {
+        /// An indirect draw: title buffer, byte offset, kind, records.
+        Draw(usize, u64, u32, u32),
+        /// A shader of the title writes `value` at a byte offset of a title
+        /// buffer (a draw or dispatch that may store: it ends the window).
+        Write(usize, u64, u32),
+        /// As `Write`, with the window left open: what a window that did not
+        /// end there would clamp.
+        WriteUnended(usize, u64, u32),
+    }
+
+    fn window_stride(kind: u32) -> u32 {
+        match kind {
+            0 => 16,
+            1 => 20,
+            _ => 12,
+        }
+    }
+
+    const WINDOW_WRITE_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
+cbuffer Word : register(b0) { uint at; uint value; };
+RWByteAddressBuffer title : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { title.Store(at, value); }
+"#;
+
+    /// The open window's draws (offset in its buffer, bytes, offset in the
+    /// results) and its buffer.
+    type WindowPending = (Vec<(u64, u64, u64)>, Option<ID3D12Resource>);
+
+    /// Records `steps` into one list over title buffers holding `init`,
+    /// each draw clamped on its own (`bound`) or (`window`) in clamp windows
+    /// (`windowed`), and runs it: the words of each draw's clamped records.
+    fn run_window_steps(init: &[Vec<u32>], steps: &[WindowStep], window: bool) -> Option<Vec<Vec<u32>>> {
+        use D3D12_RESOURCE_STATE_COPY_SOURCE as COPY_SOURCE;
+        use D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGUMENTS;
+        let host = super::host()?;
+        let _ = host.log_messages();
+        let titles: Vec<_> = init
+            .iter()
+            .map(|words| {
+                let (buffer, data) = host.shared_buffer((words.len() as u64 * 4).max(16)).unwrap();
+                // SAFETY: our mapped buffer, written before the list runs; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::copy_nonoverlapping(words.as_ptr(), data.cast::<u32>(), words.len());
+                    buffer.GetGPUVirtualAddress()
+                };
+                (buffer, gpu)
+            })
+            .collect();
+        let (results, data) = host.shared_buffer(1 << 20).unwrap();
+        let writer = compile_cs(&host.device, WINDOW_WRITE_CS).unwrap();
+        let list = host.new_list().unwrap();
+        let mut placed = Vec::new();
+        let mut at_results = 0u64;
+        let mut pending: WindowPending = (Vec::new(), None);
+        let flush = |(draws, out): &mut WindowPending| {
+            end_window(&list);
+            if let (Some(out), false) = (out.as_ref(), draws.is_empty()) {
+                // SAFETY: an open list, live buffers; `out` is in `INDIRECT_ARGUMENT`.
+                unsafe {
+                    list.list.ResourceBarrier(&[transition(out, ARGUMENTS, COPY_SOURCE)]);
+                    for &(at, len, to) in draws.iter() {
+                        list.list.CopyBufferRegion(&results, to, out, at, len);
+                    }
+                    list.list.ResourceBarrier(&[transition(out, COPY_SOURCE, ARGUMENTS)]);
+                }
+            }
+            draws.clear();
+        };
+        for &step in steps {
+            match step {
+                WindowStep::Draw(buffer, offset, kind, records) => {
+                    let stride = window_stride(kind);
+                    let spec = (kind, stride, records);
+                    let len = u64::from(stride) * u64::from(records.max(1));
+                    let source = titles[buffer].1;
+                    if window {
+                        if !joins(&list, source, spec) {
+                            flush(&mut pending);
+                        }
+                        let (out, at, _) = windowed(&list, source, offset, spec).expect("a window");
+                        pending.0.push((at, len, at_results));
+                        pending.1 = Some(out);
+                    } else {
+                        let out = bound(&list, (&titles[buffer].0, offset), None, spec).unwrap();
+                        // SAFETY: an open list, live buffers.
+                        unsafe {
+                            list.list.ResourceBarrier(&[transition(&out, ARGUMENTS, COPY_SOURCE)]);
+                            list.list.CopyBufferRegion(&results, at_results, &out, 0, len);
+                            list.list.ResourceBarrier(&[transition(&out, COPY_SOURCE, ARGUMENTS)]);
+                        }
+                    }
+                    placed.push((at_results, if records == 0 { 0 } else { len as usize / 4 }));
+                    at_results += len.next_multiple_of(256);
+                }
+                WindowStep::Write(buffer, at, value) | WindowStep::WriteUnended(buffer, at, value) => {
+                    if window && matches!(step, WindowStep::Write(..)) {
+                        flush(&mut pending);
+                    }
+                    let constants = [at as u32, value];
+                    // SAFETY: an open list; our pipeline and a title buffer.
+                    unsafe {
+                        list.list.SetComputeRootSignature(&writer.root);
+                        list.list.SetPipelineState(&writer.pso);
+                        list.list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                        list.list.SetComputeRootUnorderedAccessView(1, titles[buffer].1);
+                        list.list.Dispatch(1, 1, 1);
+                    }
+                }
+            }
+        }
+        if window {
+            flush(&mut pending);
+        }
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error recording");
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None, "the debug layer found an error running");
+        let words = |&(at, n): &(u64, usize)| {
+            // SAFETY: inside our mapped buffer; the list has run.
+            unsafe { std::slice::from_raw_parts(data.add(at as usize).cast::<u32>(), n).to_vec() }
+        };
+        Some(placed.iter().map(words).collect())
+    }
+
+    /// The windows' records, after checking they match single clamps word for word.
+    fn same_as_single(init: &[Vec<u32>], steps: &[WindowStep]) -> Option<Vec<Vec<u32>>> {
+        let single = run_window_steps(init, steps, false)?;
+        let windowed = run_window_steps(init, steps, true)?;
+        assert_eq!(single.len(), windowed.len());
+        for (k, (a, b)) in single.iter().zip(&windowed).enumerate() {
+            assert_eq!(a, b, "draw {k}: single {a:?}, windowed {b:?}");
+        }
+        Some(windowed)
+    }
+
+    /// Mesh dispatches, draws and indexed draws from two buffers, heavy mesh
+    /// records so that the budget runs out in the middle, garbage records
+    /// zeroed out, more draws than a table holds, one of 100 records across
+    /// two tiles and one of none: the clamp windows match single clamps word
+    /// for word.
+    #[test]
+    fn windows_clamp_as_single_clamps_do() {
+        let mut a = Vec::new();
+        for i in 0..400u32 {
+            a.extend(if i % 7 == 3 {
+                [65_535, 1, 1]
+            } else if i % 11 == 2 {
+                [u32::MAX; 3]
+            } else {
+                [100 + i, 1 + i % 3, i % 2]
+            });
+        }
+        let draws = a.len() as u64 * 4;
+        for i in 0..40u32 {
+            a.extend(if i % 9 == 4 { [u32::MAX; 4] } else { [3 * i + 1, 2, i, 0] });
+        }
+        let indexed = a.len() as u64 * 4;
+        for i in 0..40u32 {
+            a.extend([6 * i, 1 + i, 7, 1, i]);
+        }
+        let b: Vec<u32> = (0..64u32).flat_map(|i| [10_000 + i, 2, 3]).collect();
+        let mut steps = Vec::new();
+        for i in 0..200u64 {
+            steps.push(WindowStep::Draw(0, 12 * i, 10, 1));
+            if i % 10 == 5 {
+                steps.push(WindowStep::Draw(1, 12 * (i % 64), 10, 1));
+                steps.push(WindowStep::Draw(0, draws + 16 * (i % 40), 0, 1));
+                steps.push(WindowStep::Draw(0, indexed + 20 * (i % 40), 1, 1));
+            }
+            if i == 120 {
+                steps.push(WindowStep::Draw(0, 12 * 200, 10, 100));
+                steps.push(WindowStep::Draw(1, 0, 10, 0));
+            }
+        }
+        let Some(out) = same_as_single(&[a, b], &steps) else {
+            return; // no host GPU here
+        };
+        let ran = out.iter().filter(|r| r.first().is_some_and(|&w| w != 0)).count();
+        assert!(ran > 50 && ran + 50 < out.len(), "the budget ran out in the middle: {ran} of {} ran", out.len());
+        assert_eq!(out[0], [100, 1, 0], "a record as it is");
+    }
+
+    /// A budget spent before the window opens stays spent: its draws all
+    /// run empty, as they do clamped one by one.
+    #[test]
+    fn a_window_after_a_spent_budget_runs_empty() {
+        let mut a: Vec<u32> = [65_535, 1, 1].repeat(20);
+        a.extend([5, 1, 1].repeat(20));
+        let mut steps: Vec<WindowStep> = (0..20).map(|i| WindowStep::Draw(0, 12 * i, 10, 1)).collect();
+        // A store in between: the rest in a window of its own.
+        steps.push(WindowStep::Write(0, 0, 65_535));
+        steps.extend((20..40).map(|i| WindowStep::Draw(0, 12 * i, 10, 1)));
+        let Some(out) = same_as_single(&[a], &steps) else {
+            return; // no host GPU here
+        };
+        assert_eq!(out.iter().take(20).filter(|r| r[0] != 0).count(), 16, "16 max-mesh records fit");
+        assert!(out[20..].iter().all(|r| r[0] == 0), "the spent budget empties the window");
+    }
+
+    /// A shader writing a record between two draws ends the window: the
+    /// draw after it reads the record written, as clamped on its own. A
+    /// window left open would have clamped the record from before.
+    #[test]
+    fn a_store_ends_the_window() {
+        let a = [5, 1, 1].repeat(4);
+        let steps = |write: fn(usize, u64, u32) -> WindowStep| {
+            vec![
+                WindowStep::Draw(0, 0, 10, 1),
+                WindowStep::Draw(0, 12, 10, 1),
+                write(0, 24, 9),
+                WindowStep::Draw(0, 24, 10, 1),
+                WindowStep::Draw(0, 36, 10, 1),
+            ]
+        };
+        let Some(out) = same_as_single(std::slice::from_ref(&a), &steps(WindowStep::Write)) else {
+            return; // no host GPU here
+        };
+        assert_eq!(out[2], [9, 1, 1], "the record as written");
+        assert_eq!(out[3], [5, 1, 1]);
+        let unended = run_window_steps(&[a], &steps(WindowStep::WriteUnended), true).unwrap();
+        assert_eq!(unended[2], [5, 1, 1], "a window over the store clamps the record from before it");
+    }
+
+    /// An execution of `max` records with a count buffer asking for more
+    /// (the GPU runs min(count, max)): exactly `max` records are clamped,
+    /// across two tiles, the garbage after them in the title's buffer is
+    /// left out, and the next draw's records follow.
+    #[test]
+    fn a_window_clamps_max_records_whatever_the_count() {
+        let mut a: Vec<u32> = (0..70u32).flat_map(|i| [10 + i, 1, 0, 0]).collect();
+        a.extend([u32::MAX; 4].repeat(30));
+        a.extend([4, 4, 0, 0]);
+        let next = (a.len() as u64 - 4) * 4;
+        let steps = [WindowStep::Draw(0, 0, 0, 70), WindowStep::Draw(0, next, 0, 1)];
+        let Some(out) = same_as_single(&[a], &steps) else {
+            return; // no host GPU here
+        };
+        assert_eq!(out[0].len(), 70 * 4);
+        assert!((0..70).all(|i| out[0][4 * i] == 10 + i as u32));
+        assert_eq!(out[1], [4, 4, 0, 0]);
+    }
+
+    /// Windows keep the scratch buffer's states right: indirect arguments
+    /// while open, common when the list closes, whatever order lists run in.
+    #[test]
+    fn windows_leave_the_argument_buffer_common() {
+        use D3D12_RESOURCE_STATE_COPY_SOURCE as COPY_SOURCE;
+        use D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGUMENTS;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let _ = host.log_messages();
+        let (title, data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: our mapped buffer; a live buffer.
+        let gpu = unsafe {
+            data.cast::<[u32; 6]>().write_volatile([3, 1, 1, 4, 1, 1]);
+            title.GetGPUVirtualAddress()
+        };
+        let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
+        let readbacks: Vec<_> = lists
+            .iter()
+            .map(|l| {
+                let (rb, rb_ptr) = host.shared_buffer(256).unwrap();
+                let (out, _, opened) = windowed(l, gpu, 0, (10, 12, 1)).unwrap();
+                assert!(opened);
+                let (again, at, opened) = windowed(l, gpu, 12, (10, 12, 1)).unwrap();
+                assert!(!opened && at == 12 && again.as_raw() == out.as_raw(), "the second draw joins");
+                assert_eq!(l.indirect_state(&out), ARGUMENTS);
+                // SAFETY: an open list, live buffers; `out` is in `INDIRECT_ARGUMENT`.
+                unsafe {
+                    l.list.ResourceBarrier(&[transition(&out, ARGUMENTS, COPY_SOURCE)]);
+                    l.list.CopyBufferRegion(&rb, 0, &out, 0, 24);
+                    l.list.ResourceBarrier(&[transition(&out, COPY_SOURCE, ARGUMENTS)]);
+                }
+                l.close();
+                assert_eq!(l.indirect_state(&out), D3D12_RESOURCE_STATE_COMMON, "common after close");
+                (rb, rb_ptr)
+            })
+            .collect();
+        host.execute(&[&lists[1], &lists[0]]);
+        assert_eq!(host.log_messages(), None, "no barrier or state errors");
+        for &(_, rb_ptr) in &readbacks {
+            // SAFETY: a mapped buffer of ours, the lists have run.
+            let clamped = unsafe { rb_ptr.cast::<[u32; 6]>().read_volatile() };
+            assert_eq!(clamped, [3, 1, 1, 4, 1, 1]);
         }
     }
 

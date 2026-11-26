@@ -2662,6 +2662,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3056,6 +3057,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3554,6 +3556,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3663,6 +3666,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3697,6 +3701,7 @@ impl State {
     fn buffers_written(&mut self, list: &HostList) {
         self.writes += 1;
         list.gather_close();
+        crate::indirect::end_window(list);
         match &mut self.batch {
             Some(batch) if batches() == 2 && !crate::indirect::gather_enabled() => batch.wrote = true,
             batch => *batch = None,
@@ -3706,8 +3711,9 @@ impl State {
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
     fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
-        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+        if p.is_none_or(may_store) {
             list.gather_close();
+            crate::indirect::end_window(list);
             self.batch = None;
             if crate::indirect::hoisting() && p.is_some() {
                 self.writes += 1;
@@ -3718,6 +3724,7 @@ impl State {
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self, list: &HostList) {
         list.gather_close();
+        crate::indirect::end_window(list);
         self.window = None;
         self.batch = None;
     }
@@ -3871,6 +3878,7 @@ impl State {
                 list.gather_close();
                 self.batch = None;
             }
+            crate::indirect::end_window(list);
             self.window = None;
             args.refresh(list, arguments, len);
             if !self.prepare_for(list, false, true) {
@@ -3898,6 +3906,42 @@ impl State {
             return true;
         }
         let offset = args.offset(arguments);
+        // PR #3197 (`VICTORY_CLAMP_WINDOW=1`): consecutive non-storing indirect
+        // draws are clamped together in one pass. When active and eligible, it
+        // takes precedence over gather, batch, stepped window, and hoist for
+        // this draw; when off, the existing path runs unchanged.
+        let clamp_window = if crate::indirect::windows_on() {
+            if kind != DISPATCH && !may_store(p) {
+                args.refresh(list, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
+                // SAFETY: a live host buffer, kept alive until the list resets.
+                let base = unsafe { args.buffer.GetGPUVirtualAddress() };
+                list.keep(&args.buffer);
+                let hit = crate::indirect::windowed(list, base, offset, (kind, stride, max));
+                if let Some((_, _, opened)) = &hit {
+                    if *opened {
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                    }
+                    list.gather_close();
+                    self.batch = None;
+                    self.window = None;
+                } else {
+                    crate::indirect::end_window(list);
+                }
+                hit.map(|(out, at, _)| (out, at))
+            } else {
+                crate::indirect::end_window(list);
+                None
+            }
+        } else {
+            None
+        };
+        let (bounded, at) = if let Some(hit) = clamp_window {
+            hit
+        } else {
         let gather = crate::indirect::gather_enabled();
         let gatherable = gather && kind != DISPATCH && max == 1 && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores)
@@ -3976,7 +4020,7 @@ impl State {
             let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
             hoisted = crate::indirect::bound_before(h, (&args.buffer, offset), count_arg, (kind, stride, max));
         }
-        let (bounded, at) = match batch.or(hit) {
+        match batch.or(hit) {
             Some(hit) => hit,
             None if hoisted.is_some() => {
                 let Some((bounded, at)) = hoisted.take() else { unreachable!() };
@@ -4039,6 +4083,7 @@ impl State {
                 });
                 (bounded, 0)
             }
+        }
         };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
@@ -4104,6 +4149,12 @@ impl State {
         }
         true
     }
+}
+
+/// Whether a pipeline's shaders may store to buffers. Such a draw ends a
+/// clamp window (`crate::indirect::windowed`).
+fn may_store(p: &HostPipeline) -> bool {
+    p.stages.iter().any(|stage| stage.translated().stores)
 }
 
 /// `DispatchX`: the counts are threads (the console's dispatch initiator bit

@@ -391,7 +391,7 @@ fn cut(this: This, wait: ValueWait) {
 /// new list, with the state the title set.
 #[cfg(windows)]
 fn hoist(this: This) {
-    if this.is_null() || !crate::indirect::hoisting() {
+    if this.is_null() || !crate::indirect::hoisting() || crate::indirect::windows_on() {
         return;
     }
     // SAFETY: the title passes one of our lists; a list is recorded by one
@@ -458,7 +458,7 @@ fn end_hoist(list: &mut List) {
 /// clamps ends before the next indirect draw.
 #[cfg(windows)]
 fn note_write(this: This) {
-    if this.is_null() || !crate::indirect::hoisting() {
+    if this.is_null() || !crate::indirect::hoisting() || crate::indirect::windows_on() {
         return;
     }
     // SAFETY: the title passes one of our lists.

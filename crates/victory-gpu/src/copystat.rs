@@ -129,8 +129,19 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Argument clamps by path (`crate::indirect`): single inline (`bound`),
+    /// batched (`batch`), stepped windows (`bound_ahead`), hoisted
+    /// (`bound_before`), and clamp windows (`VICTORY_CLAMP_WINDOW=1`) with
+    /// the draws they took.
+    ClampSingle,
+    ClampBatched,
+    ClampSteppedWindows,
+    ClampHoisted,
+    ClampWindows,
+    ClampWindowDraws,
 }
 const COUNTERS: usize = 80;
+const _: () = assert!((C::ClampWindowDraws as usize) < COUNTERS);
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -1186,6 +1197,18 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
         c[C::TexHot as usize],
+    );
+    let (single, batched, stepped, hoisted, clamp_windows, clamp_window_draws) = (
+        c[C::ClampSingle as usize],
+        c[C::ClampBatched as usize],
+        c[C::ClampSteppedWindows as usize],
+        c[C::ClampHoisted as usize],
+        c[C::ClampWindows as usize],
+        c[C::ClampWindowDraws as usize],
+    );
+    tracing::info!(
+        "indirect clamps per frame: {single:.0} single, {batched:.0} batched, {stepped:.0} stepped windows, {hoisted:.0} hoisted, {clamp_windows:.0} clamp windows (avg {:.1} draws)",
+        if clamp_windows > 0.0 { clamp_window_draws / clamp_windows } else { 0.0 },
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
