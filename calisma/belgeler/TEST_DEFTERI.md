@@ -27,6 +27,8 @@ Bu yüzden CPU/RAM tarafında kazandıran ayarlar başkasında fps artırsa da b
 
 | Ne | Kaynak | Başkasında | Bizde | Neden bizde olmadı (kanıt / TAHMİN) |
 |---|---|---|---|---|
+| CARD_BUFFERS_MB=1024 + CARD_WINDOWS_MB=256 (Impre-visible GTX1660 / kelvaroq 0039) — 2 tur × 150 sn | GTX 1660 6 GB Linux: 360-410 → 98-112 ms | taban 127 / 117, 1024'lü 117 / 135 (ort. 122 vs 126) | gürültü içinde, kazanç yok; ret. Onlarda kart tamponu yoktu (Linux vkd3d), bizde zaten tampon/pencere yolu ayarlı |
+| Yeni taban 2de9980'e geçiş — KARAR | — | y2b karesi: oda karanlık, tel örgü ve duvar dokusu yok, RAM 17.7 GB; bizim taban aynı sahnede tam (rsb 245 sn) | Yiğit 22:30 'bizimki görüntüde daha sağlam' + ölçüm 127 vs 113 → tabanı değiştirmiyoruz; yalnız hedefli parçalar (ör. PORT_GUARD) ayrı ayrı alınabilir |
 | + VIEW_BYTES=0 — y2c, 1 koşu | RTX 5070: 106 → 77 ms (portsuz) | **127 → 140 ms**, kopyalar duruyor | bizde ters: o görünümleri reddetmek burada yavaşlatıyor; ret |
 | 2de9980 + havuz + PORT 2+6+7 (DESCRIPTORS/GUARD/JOURNAL) — y2b, 1 koşu | RTX 5070 12 GB: 2+6+7 79 ms (1+2+5+6+7 135) | **138 → 127 ms** (JOURNAL bekleme 1.8 ms/kare, sayaç devrede) | yeni taban portlarla 11 ms iniyor; bizim taban 113. Yeni tabanda CLAMP_WAITS, RT skip, BVH_MISS yok → taşınacak |
 | 2de9980 + pr0vId3nce #221 havuz yaması — y2a, 1 koşu | RTX 4080: 276 → 142 ms | **314 → 138 ms**, 377 kopya/kare hepsi havuzdan, kilit 1.4 ms | yama tutuyor ama hâlâ bizim tabandan (113) yavaş; portlar ve VIEW_BYTES=0 ölçülüyor |
