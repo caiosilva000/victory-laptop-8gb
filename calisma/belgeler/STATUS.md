@@ -25,6 +25,7 @@ G0j. [RET 15:55] Pencereler kartta: 4 çift 150 sn, ort. −1.8 ms (146→137/14
 G0k. [16:15] HOIST_CLAMPS taban üstü 143→146/148→147 = sıfır test (INDIRECT_WINDOW=1 hoist'i engelliyor). Şimdi hcc/hcd: taban / WINDOW=0 / WINDOW=0+HOIST, 2 tur × 150 sn.
 G0l. [16:35] DERS: kosu.ps1 target\diag\victory.exe kullanır → her porttan sonra 'cargo build --profile diag --features diagnostics -p victory'. HOIST testleri eski ikiliyle koşmuştu; hce/hcf (taban/hoist/win0+hoist) + hcg-win0 yeni diag ile sürüyor.
 G0m. [17:05] HOIST yeni diag: taban 151/142, hoist 145/139, win0+hoist 143/138 (iki turda aynı yön, −%3-4). hch/hci 2 tur daha. win0 tek başına 3/3 açılışta çöküyor.
+G0n. [17:40] SOL TARAMA 17:13: 657 portwatch repo + 8 ek; Marvisak 397 / fxceless 110 kayıt güncel. En güçlü: #3197 CLAMP_WINDOW (3070 Win: GPU 199→170) → Neon portluyor (sayaçla). Sonra #3228 UPLOAD_VRAM. Ret: #3102, #3118. INDIRECT_WINDOW=0 çökmesine düzeltme yok.
 GOAL (Yiğit 13:47): Sol her 3 saatte portwatch tracker.json dahil tarama (cron 6330ca1c, 16:43'ten itibaren), testler bulgulara göre.
 G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
 G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).
