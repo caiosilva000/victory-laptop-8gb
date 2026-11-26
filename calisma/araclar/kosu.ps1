@@ -37,6 +37,9 @@ $taban = [ordered]@{
     VICTORY_PANEL              = '1'
     # 26.11 14:25 CLAMP_WAITS=0 kabul (cwb 149.3 -> 143.0 ms, p90 250 -> 146; goruntu ayni).
     VICTORY_CLAMP_WAITS        = '0'
+    # 26.11 18:30 KABUL: oyunun kendi TAA upscaler'i + %50 ic cozunurluk (rsa/rsb: 143.5 -> 113 ms, -%21)
+    VICTORY_OWN_UPSCALER       = '1'
+    VICTORY_RENDER_SCALE       = '0.5'
     VICTORY_RT_SKIP_RESOLVE    = '1'
     VICTORY_RT_SKIP_ACTIVATE   = '1'
     VICTORY_INDIRECT_BATCH     = '2'

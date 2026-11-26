@@ -29,6 +29,7 @@ G0n. [17:40] SOL TARAMA 17:13: 657 portwatch repo + 8 ek; Marvisak 397 / fxceles
 G0o. [RET 17:35] HOIST_CLAMPS 4 tur: ort 145.3 → 143.5 (−%1.2, gürültü). Kapalı. Sırada: Neon #3197 CLAMP_WINDOW + clamp sayacı → sayaçla clamp'lerin ne kadarının zaten pencerede olduğunu göreceğiz.
 G0p. [RET 18:00] CLAMP_WINDOW 143→144, 135→146. Yeni sayaç: tabanda kare başına sadece ~158 clamp (BATCH=2 zaten topluyor) → clamp yönü kapandı. Kart süresi başka yerde: sıradaki büyük kaldıraç RENDER_SCALE (G1, trustno1 afd84de1) → Neon portu; önce sayaç/teşhis.
 G0q. [18:05] RENDER_SCALE portu a8ae91f (hash+desen korumalı; log: 'title resolution levers'). Prob: 0.5 tek başına (FSR yolu) açılışta 0xC0000094 sıfıra bölme ile çöktü; 0.5 + OWN_UPSCALER=1 dünyaya girdi, son 60 sn medyan 121 ms (taban ~143), görüntü sağlam/biraz yumuşak. A/B rsa/rsb (taban / own / own+0.5) sürüyor.
+G0r. [KABUL 18:30] OWN_UPSCALER=1 + RENDER_SCALE=0.5 tabana: 143.5 → 113 ms (−%21; yalnız own −%10). Görüntü yumuşak. Sırada: 0.6/0.75 kalite-hız eğrisi, sonra #3228 UPLOAD_VRAM yeni tabanla.
 GOAL (Yiğit 13:47): Sol her 3 saatte portwatch tracker.json dahil tarama (cron 6330ca1c, 16:43'ten itibaren), testler bulgulara göre.
 G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
 G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).

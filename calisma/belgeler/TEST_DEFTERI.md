@@ -20,6 +20,7 @@ Bu yüzden CPU/RAM tarafında kazandıran ayarlar başkasında fps artırsa da b
 | WINDOWS_BAR_PERCENT=88, WINDOW_KB=256, TAILS, SEND_KEPT_MB=128 | bizim RAM işi | — | kilitli RAM 4726 → 3252 MB, 10 dk sızıntısız | RAM kabulü, fps aynı |
 | Windows 10 Agility SDK desteği | bizim | BlatWolf (4060, Win10) için | Win11'de etkisiz, Win10'da çökmeyi önler | 90d3c4f |
 | CLAMP_WAITS=0 (victory-scarlett f748fb557a / Trexies 6b358fe, Sol portu 02d7284) | scarlett | Trexies: clamp başı 2 tam bekleme, ~30-50 ms kart iddiası (4080S) | cwb temiz çift **149.3 → 143.0 ms**, p90 250 → 146; cwa: taban bozuk (n=5, 389 ms), clampwaits 145.6 / p90 153 | Küçük kazanç (~%4) ama kareler çok daha düzgün (p90 hep ~145-153). Görüntü aynı (kare_0170s). Bizde clamp'ler zaten toplu, o yüzden 30-50 ms değil (TAHMİN). Tabana alınacak (kw serisi bitince). 26.11 14:10 |
+| OWN_UPSCALER=1 + RENDER_SCALE=0.5 (trustno1 afd84de1 ← victory-perf ← ScarlettPort; Neon portu a8ae91f) | RTX 5070: GPU 110 → 82-88 ms | 2 tur × 150 sn, son 60 sn: taban **142/145** · yalnız OWN_UPSCALER **127/132 (−%10)** · OWN+0.5 **112/114 (−%21)** | Bizde de çalıştı çünkü darboğaz kart: piksel işi yarıya inince kart süresi doğrudan düşüyor. RENDER_SCALE tek başına (FSR yolu) açılışta 0xC0000094 sıfıra bölme ile çöküyor → OWN_UPSCALER şart. Görüntü daha yumuşak, avluda hareketli kişilerde hafif hayalet; yüzde 0.6/0.75 seçenekleri sırada. |
 
 ## Reddedilenler
 
