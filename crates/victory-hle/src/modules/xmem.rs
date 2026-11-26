@@ -169,6 +169,7 @@ pub extern "system" fn XMemVirtualAlloc(
         }
     }
     if base.is_null() {
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
@@ -1875,6 +1876,9 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
+        if kind & MEM_RELEASE != 0 {
+            victory_gpu::title_memory_released(address as usize);
+        }
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }

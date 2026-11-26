@@ -4837,6 +4837,9 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
+                            if crate::wc::skip_back(r.declared, r.shadow.span().1, (hi - lo) as u64) {
+                                continue;
+                            }
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                 land::count(land::stat::HAD, 1);
@@ -5210,7 +5213,12 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                let key = (std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi);
+                if lo < hi
+                    && !seen.contains(&key)
+                    && !crate::wc::skip_back(r.declared, r.shadow.span().1, (hi - lo) as u64)
+                    && seen.insert(key)
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -9438,6 +9446,17 @@ impl Meter {
                     per_frame(4) / 1e6,
                     per_frame(5),
                     per_frame(6) / 1e3
+                );
+            }
+            if crate::wc::skip_wc_back() {
+                let [skip_n, skip_b, kept_n, kept_b] = crate::wc::take_stats();
+                tracing::info!(
+                    "skipped WC copy-back: {:.0} copies, {:.1} MB; kept (under MIN_KB={} KB): {:.0} copies, {:.1} MB",
+                    skip_n as f64 / frames,
+                    skip_b as f64 / 1e6 / frames,
+                    crate::wc::skip_wc_back_min_kb(),
+                    kept_n as f64 / frames,
+                    kept_b as f64 / 1e6 / frames,
                 );
             }
             tracing::info!(

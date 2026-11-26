@@ -92,6 +92,8 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod wc;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]
@@ -111,6 +113,8 @@ pub fn frame_phase() -> u32 {
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use wc::{title_memory_released, title_memory_reserved};
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
