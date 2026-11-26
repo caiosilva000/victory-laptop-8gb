@@ -25,6 +25,7 @@ Bu yüzden CPU/RAM tarafında kazandıran ayarlar başkasında fps artırsa da b
 
 | Ne | Kaynak | Başkasında | Bizde | Neden bizde olmadı (kanıt / TAHMİN) |
 |---|---|---|---|---|
+| HOIST_CLAMPS=1 (fxceless #1184, Neon portu; yeni diag, 4 tur × 150 sn, son 60 sn medyanı) | 5070 Ti kontrollü A/B: kart 127 → 107 ms (−%16) | taban 151/142/147/141 (ort 145.3) · hoist 145/139/142/148 (ort **143.5, −1.2%**) · INDIRECT_WINDOW=0+hoist 143/138/162/139 (ort 145.5) | İlk iki tur −%3-4 gösterdi, son iki tur geri aldı → gürültü içinde. Neden bizde az: tabanda INDIRECT_WINDOW=1 + BATCH=2 + CLAMP_WAITS=0 clamp maliyetinin çoğunu zaten almış; 5070 Ti testi bunlar olmadan. Kod kapalı kalır (93146f5). INDIRECT_WINDOW=0 tek başına açılışta 3/3 çöküyor, hoist ile çökmüyor. |
 | HOIST_CLAMPS=1 (fxceless #1184, Neon portu) — taban üstüne (2 çift × 150 sn) | 5070 Ti kontrollü A/B: kart 127 → 107 ms | **143→146, 148→147 ms** → GEÇERSİZ: kosu.ps1 **diag** derlemesini çalıştırıyor, port yalnız release'e derlenmişti (diag 15:09). hcc/hcd (WINDOW=0) da eski ikiliyle → geçersiz. Diag 16:33'te derlendi, hce/hcf tekrar koşuyor. | Bizim tabanda INDIRECT_WINDOW=1 + INDIRECT_BATCH=2 açık: tek kayıtlı indirect çizimler pencere/toplu yoldan gidiyor, ön listeye alma neredeyse hiç devreye girmiyor. Pencere kapalı üç kollu test (taban / WINDOW=0 / WINDOW=0+HOIST) sürüyor. |
 | Pencereleri karta taşıma: RIPE_BLOCKS=4 + CARD_WINDOWS_MB=1536 + CARD_WINDOWS_PERCENT=95 (4 çift × 150 sn, son 60 sn medyanı) | bizim (80% kapısını açan anahtar) | — | **146→137, 146→147, 148→146, 138→141 ms** (ort. −1.8 ms, gürültü içinde); kartta kopya 12→495-665, +300-400 MB taşındı | Taşıma çalışıyor ama kare süresine yansımıyor: darboğaz kartın kendi hesap yükü, pencere verisinin PCIe'den okunması değil. ProbeGather sıçramaları kısaldı (32-42 → 26-28 ms) ama kare başına etkisi ~1 ms. Kapalı kalır. |
 | SHADER_LOOP_LIMIT=4096 TEYİT (150 sn) | — | — | lld-loop **152 ms** (son 60 sn); aynı saatteki tabanlar 146 / 149 (lld-taban açılmadı) | İlk çiftteki 172 → 154 farkı tabanın kötü dilimiydi; teyitte kazanç yok → ret kesinleşti. 26.11 15:15 |
@@ -68,7 +69,6 @@ Bu yüzden CPU/RAM tarafında kazandıran ayarlar başkasında fps artırsa da b
 | BVH_MISS tek başına | 176/162 vs 208 ms | Bir taban bozuktu; paketle birlikte kabul edildi. |
 | ASYNC_SUBMIT=1 | 154 → 148 ms (1 temiz çift) | Küçük; ikinci temiz çift gerek. |
 | CBV_DIRECT=1 | 267 → 255 ms (eski taban) | Gürültü eşiğinin altında; tekrar gerek. |
-| HOIST_CLAMPS=1 (yeni diag, 26.11 16:33-17:01; son 60 sn medyanı) | taban 151 / 142 · hoist 145 / 139 · INDIRECT_WINDOW=0+hoist 143 / 138 ms | İki turda da aynı yön: hoist ~−%3, pencere kapalı + hoist ~−%4. %5 altında → 2 tur daha (hch/hci) sürüyor. Başkasında: 5070 Ti kart 127→107 (−%16). **INDIRECT_WINDOW=0 tek başına 3/3 açılışta 6-10 sn'de çöküyor** (çıkış -1, log device kurulumunda kesiliyor); hoist ile birlikte çökmüyor. |
 
 ## Sırada (STATUS.md "TEST LİSTESİ")
 
