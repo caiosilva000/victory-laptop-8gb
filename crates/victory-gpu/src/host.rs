@@ -57,6 +57,9 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Cached `(checked_at, local_used_bytes, local_budget_bytes)` for
+    /// `VICTORY_UPLOAD_VRAM=1` headroom checks.
+    upload_vram_headroom: Mutex<Option<(std::time::Instant, u64, u64)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -796,6 +799,14 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// For the memory line: against what is alive, they show what was let go.
 pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Upload buffer placements since the start (`Host::upload_buffer`):
+/// `[0]` video-memory count, `[1]` video-memory bytes,
+/// `[2]` system-memory count, `[3]` system-memory bytes,
+/// `[4]` fell back: no room (VRAM >= 80% budget or unknown),
+/// `[5]` fell back: unsupported (`GPUUploadHeapSupported` false),
+/// `[6]` fell back: allocation or map error.
+pub(crate) static UPLOAD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
 /// What of that is alive now, for the memory line (`MADE` counts what was
 /// ever made: 42,607 upload buffers, 77.9 GB, in five minutes of run 60,
 /// and nothing said how many were alive): host lists; the lists' scratch
@@ -1032,6 +1043,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            upload_vram_headroom: Mutex::new(None),
         })
     }
 }
@@ -1069,6 +1081,60 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upload_vram_env_defaults_off() {
+        assert!(!super::parse_upload_vram_env(None));
+        for off in ["", "0", "false", "FALSE", "off", "no", "maybe"] {
+            assert!(!super::parse_upload_vram_env(Some(off)), "{off:?}");
+        }
+        for on in ["1", " 1 ", "true", "TRUE", "on", "yes"] {
+            assert!(super::parse_upload_vram_env(Some(on)), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn upload_vram_fits_checks_80_percent_headroom() {
+        assert!(!super::upload_vram_fits(0, 0, 1024));
+        assert!(super::upload_vram_fits(790, 1000, 10));
+        assert!(!super::upload_vram_fits(790, 1000, 11));
+        assert!(!super::upload_vram_fits(6_500_000_000, 7_250_000_000, 64 << 10));
+        assert!(!super::upload_vram_fits(u64::MAX, 1000, 1));
+    }
+
+    #[test]
+    fn upload_vram_placement_defaults_to_system_and_falls_back_when_no_room() {
+        use super::{UploadPlacement, choose_upload_placement, upload_vram_fits};
+        let mut probed_support = false;
+        let mut probed_headroom = false;
+        assert_eq!(
+            choose_upload_placement(
+                false,
+                || {
+                    probed_support = true;
+                    true
+                },
+                || {
+                    probed_headroom = true;
+                    true
+                },
+            ),
+            UploadPlacement::SystemDisabled
+        );
+        assert!(!probed_support && !probed_headroom, "disabled path must skip VRAM probes");
+        assert_eq!(
+            choose_upload_placement(true, || false, || unreachable!()),
+            UploadPlacement::SystemFallbackUnsupported
+        );
+        assert_eq!(
+            choose_upload_placement(true, || true, || upload_vram_fits(6_200_000_000, 7_250_000_000, 64 << 10)),
+            UploadPlacement::SystemFallbackNoRoom
+        );
+        assert_eq!(
+            choose_upload_placement(true, || true, || upload_vram_fits(4_000_000_000, 7_250_000_000, 64 << 10)),
+            UploadPlacement::VideoMemory
+        );
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -8631,6 +8697,120 @@ impl Host {
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
+        match choose_upload_placement(
+            upload_vram_enabled(),
+            || self.mapped_card_memory(),
+            || self.upload_vram_has_headroom(size),
+        ) {
+            UploadPlacement::VideoMemory => {
+                if let Some(made) = self.upload_vram_buffer(size) {
+                    self.note_upload_vram(size);
+                    UPLOAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    UPLOAD_STATS[1].fetch_add(size, Ordering::Relaxed);
+                    return Some(made);
+                }
+                UPLOAD_STATS[6].fetch_add(1, Ordering::Relaxed);
+            }
+            UploadPlacement::SystemDisabled => {}
+            UploadPlacement::SystemFallbackNoRoom => {
+                UPLOAD_STATS[4].fetch_add(1, Ordering::Relaxed);
+            }
+            UploadPlacement::SystemFallbackUnsupported => {
+                UPLOAD_STATS[5].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let made = self.system_upload_buffer(size)?;
+        UPLOAD_STATS[2].fetch_add(1, Ordering::Relaxed);
+        UPLOAD_STATS[3].fetch_add(size, Ordering::Relaxed);
+        Some(made)
+    }
+
+    fn upload_vram_has_headroom(&self, size: u64) -> bool {
+        let mut cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let refresh = size >= (4 << 20)
+            || cache
+                .as_ref()
+                .is_none_or(|(at, _, _)| now.duration_since(*at) >= std::time::Duration::from_millis(250));
+        if refresh {
+            let Some([budget, used, ..]) = self.video_memory() else {
+                *cache = None;
+                return false;
+            };
+            *cache = Some((now, used, budget));
+        }
+        let Some((_, used, budget)) = &*cache else {
+            return false;
+        };
+        upload_vram_fits(*used, *budget, size)
+    }
+
+    fn note_upload_vram(&self, size: u64) {
+        let mut cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, used, _)) = cache.as_mut() {
+            *used = used.saturating_add(size);
+        }
+    }
+
+    fn invalidate_upload_vram(&self) {
+        *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn upload_vram_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: GPU_UPLOAD buffers start in COMMON and are persistently mapped.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    not_resident(),
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&self.device, b)?;
+                    mapped(&self.device)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "an upload buffer (video memory)".into());
+        }
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                self.invalidate_upload_vram();
+                tracing::debug!(error = %e, size, "GPU_UPLOAD buffer fell back to system UPLOAD");
+                None
+            }
+        }
+    }
+
+    fn system_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             ..Default::default()
@@ -8681,6 +8861,68 @@ impl Host {
             }
         }
     }
+}
+
+/// Whether `Host::upload_buffer` tries `D3D12_HEAP_TYPE_GPU_UPLOAD` (VRAM via
+/// Resizable BAR) while local VRAM stays under 80% of its DXGI budget.
+/// Off by default; `VICTORY_UPLOAD_VRAM=1` enables it.
+fn parse_upload_vram_env(val: Option<&str>) -> bool {
+    val.is_some_and(|v| {
+        let v = v.trim();
+        v == "1"
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("on")
+            || v.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn upload_vram_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_upload_vram_env(std::env::var("VICTORY_UPLOAD_VRAM").ok().as_deref()))
+}
+
+fn upload_vram_fits(local_used_bytes: u64, local_budget_bytes: u64, size: u64) -> bool {
+    let p = upload_vram_percent();
+    local_budget_bytes > 0
+        && local_used_bytes.saturating_add(size)
+            <= local_budget_bytes / 100 * p + (local_budget_bytes % 100) * p / 100
+}
+
+/// How much of the card's budget upload buffers may fill up to
+/// (`VICTORY_UPLOAD_VRAM_PERCENT`, 10-98, 80 by default).
+fn upload_vram_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_VRAM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(10, 98))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadPlacement {
+    VideoMemory,
+    SystemDisabled,
+    SystemFallbackNoRoom,
+    SystemFallbackUnsupported,
+}
+
+fn choose_upload_placement(
+    enabled: bool,
+    gpu_upload_supported: impl FnOnce() -> bool,
+    has_headroom: impl FnOnce() -> bool,
+) -> UploadPlacement {
+    if !enabled {
+        return UploadPlacement::SystemDisabled;
+    }
+    if !gpu_upload_supported() {
+        return UploadPlacement::SystemFallbackUnsupported;
+    }
+    if !has_headroom() {
+        return UploadPlacement::SystemFallbackNoRoom;
+    }
+    UploadPlacement::VideoMemory
 }
 
 /// The swap chain formats a presented texture can be copied into: its own

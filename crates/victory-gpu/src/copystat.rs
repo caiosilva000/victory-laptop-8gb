@@ -1210,6 +1210,14 @@ pub(crate) fn log(frames: f64) {
         "indirect clamps per frame: {single:.0} single, {batched:.0} batched, {stepped:.0} stepped windows, {hoisted:.0} hoisted, {clamp_windows:.0} clamp windows (avg {:.1} draws)",
         if clamp_windows > 0.0 { clamp_window_draws / clamp_windows } else { 0.0 },
     );
+    let [vram_n, vram_b, ram_n, ram_b, fb_room, fb_unsup, fb_err] =
+        [0, 1, 2, 3, 4, 5, 6].map(|i| crate::host::UPLOAD_STATS[i].load(Relaxed));
+    let fb_total = fb_room + fb_unsup + fb_err;
+    tracing::info!(
+        "upload buffers: {vram_n} in video memory ({:.1} MB), {ram_n} in system memory ({:.1} MB, {fb_total} fell back: {fb_room} no room, {fb_unsup} unsupported, {fb_err} error)",
+        mb(vram_b as f64),
+        mb(ram_b as f64),
+    );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
