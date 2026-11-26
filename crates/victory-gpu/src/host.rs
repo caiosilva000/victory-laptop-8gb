@@ -2321,6 +2321,12 @@ struct Deferred {
     budget_zeroed: bool,
     /// The prelude, rather than the title list, starts the card budget.
     budget_in_prelude: bool,
+    /// Another list's budget this recording charges instead of its own
+    /// (`crate::indirect::hoisting`: the pieces of one title list share
+    /// one), and whether it is the card's copy; then whether a clamp of
+    /// this recording used it.
+    lent_budget: Option<(ID3D12Resource, bool)>,
+    lent_used: bool,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -6973,15 +6979,37 @@ impl HostList {
 
     /// The buffer for the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<&ID3D12Resource> {
+    pub(crate) fn budget(&self) -> Option<ID3D12Resource> {
         self.budget_for(false)
     }
 
-    pub(crate) fn prelude_budget(&self) -> Option<&ID3D12Resource> {
+    pub(crate) fn prelude_budget(&self) -> Option<ID3D12Resource> {
         self.budget_for(true)
     }
 
-    fn budget_for(&self, prelude: bool) -> Option<&ID3D12Resource> {
+    fn budget_for(&self, prelude: bool) -> Option<ID3D12Resource> {
+        {
+            let mut deferred = self.deferred();
+            if let Some((lent, card)) = deferred.lent_budget.clone() {
+                if prelude {
+                    return None;
+                }
+                if card && !deferred.lent_used {
+                    // The owner's list left the card's copy common when it
+                    // closed; this one gives it back so when it closes.
+                    // SAFETY: an open list and a live buffer.
+                    unsafe {
+                        self.list.ResourceBarrier(&[transition(
+                            &lent,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )])
+                    };
+                }
+                deferred.lent_used = true;
+                return Some(lent);
+            }
+        }
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -7022,7 +7050,30 @@ impl HostList {
                 Self::zero_card_budget(&self.list, card);
             }
         }
-        Some(card.unwrap_or(buffer))
+        Some(card.unwrap_or(buffer).clone())
+    }
+
+    /// The budget this recording charges, made ready here if it is not yet,
+    /// for other lists of the same title list to charge too
+    /// ([`HostList::lend_budget`]): the buffer and whether it is the card's copy.
+    pub(crate) fn budget_to_lend(&self) -> Option<(ID3D12Resource, bool)> {
+        self.budget()?;
+        if let Some(lent) = self.deferred().lent_budget.clone() {
+            return Some(lent);
+        }
+        match self.card_budget.get().and_then(Option::as_ref) {
+            Some(card) => Some((card.clone(), true)),
+            None => self.budget.get().and_then(Option::as_ref).map(|(b, _)| (b.clone(), false)),
+        }
+    }
+
+    /// From here until its reset the list's clamps charge `budget`
+    /// ([`HostList::budget_to_lend`] of a list that runs before it, in the
+    /// same submission) instead of a budget of its own.
+    pub(crate) fn lend_budget(&self, budget: (ID3D12Resource, bool)) {
+        let mut deferred = self.deferred();
+        deferred.lent_budget = Some(budget);
+        deferred.lent_used = false;
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -7071,6 +7122,22 @@ impl HostList {
     /// of the budget: its notes on mesh records go to the mapped words
     /// (read at the next submission), and it goes back to common.
     fn card_budget_out(&self) {
+        {
+            let deferred = self.deferred();
+            if let Some((lent, card)) = &deferred.lent_budget {
+                if *card && deferred.lent_used {
+                    // SAFETY: an open list; the lent buffer is in unordered access.
+                    unsafe {
+                        self.list.ResourceBarrier(&[transition(
+                            lent,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )])
+                    };
+                }
+                return;
+            }
+        }
         if !self.deferred().budget_zeroed {
             return;
         }

@@ -327,6 +327,16 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// With `crate::indirect::hoisting`: the open host list before this
+    /// one's that takes the clamps of the run of indirect draws recorded now.
+    pub(crate) hoist: Option<crate::indirect::Hoist>,
+    /// Title commands recorded that may write indirect arguments
+    /// (dispatches, copies, resolves, memory writes, draws whose shaders
+    /// store): a run of hoisted clamps ends at the next one.
+    pub(crate) writes: u64,
+    /// The budget the pieces of this title list share since its first run
+    /// of hoisted clamps (`crate::host::HostList::lend_budget`).
+    pub(crate) budget_of: Option<(ID3D12Resource, bool)>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -3685,6 +3695,7 @@ impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
     fn buffers_written(&mut self, list: &HostList) {
+        self.writes += 1;
         list.gather_close();
         match &mut self.batch {
             Some(batch) if batches() == 2 && !crate::indirect::gather_enabled() => batch.wrote = true,
@@ -3698,6 +3709,9 @@ impl State {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
             list.gather_close();
             self.batch = None;
+            if crate::indirect::hoisting() && p.is_some() {
+                self.writes += 1;
+            }
         }
     }
 
@@ -3906,7 +3920,9 @@ impl State {
         let batch = if gathered.is_some() {
             gathered
         } else if (if gatherable { crate::indirect::gather_runs() } else { batches() > 0 })
-            && max == 1 && count.is_none()
+            && max == 1
+            && count.is_none()
+            && !(kind != DISPATCH && self.topology != RECTANGLES && self.hoist.is_some() && !windows())
         {
             if !gatherable {
                 args.refresh(list, arguments, len);
@@ -3943,8 +3959,31 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        // The run's clamps in the list before (`crate::indirect::hoisting`):
+        // nothing of ours between this list's draws.
+        let mut hoisted = None;
+        if batch.is_none()
+            && hit.is_none()
+            && kind != DISPATCH
+            && !windowed
+            && self.topology != RECTANGLES
+            && let Some(h) = self.hoist.as_mut()
+        {
+            args.refresh(&h.clamps, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(&h.clamps, *at, 4);
+            }
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            hoisted = crate::indirect::bound_before(h, (&args.buffer, offset), count_arg, (kind, stride, max));
+        }
         let (bounded, at) = match batch.or(hit) {
             Some(hit) => hit,
+            None if hoisted.is_some() => {
+                let Some((bounded, at)) = hoisted.take() else { unreachable!() };
+                self.window = None;
+                list.keep(&bounded);
+                (bounded, at)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
