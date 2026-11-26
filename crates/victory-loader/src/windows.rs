@@ -84,6 +84,13 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    let image_size = loaded.info.size_of_image as usize;
+    let is_dll = loaded.info.is_dll();
+    // SAFETY: just mapped, and no title code has run.
+    unsafe {
+        crate::hooks::disarm_watchdog(loaded.base(), image_size, &prepared.original_hash, is_dll);
+        crate::hooks::resolution_levers(loaded.base(), image_size, &prepared.original_hash, is_dll);
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
