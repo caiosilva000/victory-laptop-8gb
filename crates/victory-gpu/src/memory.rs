@@ -143,9 +143,114 @@ struct Packed {
     header: u64,
 }
 
+/// Backing storage for the address directory.
+enum Directory {
+    /// Default path: CPU watched memory synced to a card shadow on `bring_up`.
+    Shadow {
+        entries: *mut u32,
+        shadow: Arc<Shadow>,
+    },
+    /// `VICTORY_TABLES_ON_CARD=1`: write-combined GPU upload heap written
+    /// directly by the CPU; CPU reads go through `mirror`.
+    Card {
+        buffer: ID3D12Resource,
+        mapped: *mut u32,
+        gpu: u64,
+        mirror: Vec<u32>,
+    },
+}
+
+impl Directory {
+    fn read(&self, page: u64) -> u32 {
+        debug_assert!(page < u64::from(MEMORY_PAGES));
+        let i = page as usize * 2;
+        match self {
+            // SAFETY: inside the directory mapping, under the mutex.
+            Self::Shadow { entries, .. } => unsafe { entries.add(i).read() },
+            Self::Card { mirror, .. } => mirror[i],
+        }
+    }
+
+    /// The offset first: a shader that sees the number sees it too.
+    fn fill(&mut self, page: u64, n: usize, offset: u64) {
+        debug_assert!(page < u64::from(MEMORY_PAGES));
+        let i = page as usize * 2;
+        let val = n as u32 + 1;
+        let off = offset as u32;
+        match self {
+            Self::Shadow { entries, .. } => {
+                // SAFETY: an entry of the directory, under the mutex.
+                unsafe {
+                    entries.add(i + 1).write_volatile(off);
+                    entries.add(i).write_volatile(val);
+                }
+            }
+            Self::Card { mapped, mirror, .. } => {
+                mirror[i] = val;
+                mirror[i + 1] = off;
+                // SAFETY: inside the GPU upload mapping, under the mutex.
+                unsafe {
+                    mapped.add(i + 1).write_volatile(off);
+                    mapped.add(i).write_volatile(val);
+                }
+            }
+        }
+    }
+
+    /// [`Directory::fill`] of a page stores by address do not reach.
+    fn close(&mut self, page: u64, n: usize, offset: u64) {
+        self.fill(page, n | MEMORY_READ_ONLY as usize, offset);
+    }
+
+    fn clear(&mut self, page: u64) {
+        debug_assert!(page < u64::from(MEMORY_PAGES));
+        let i = page as usize * 2;
+        match self {
+            Self::Shadow { entries, .. } => {
+                // SAFETY: an entry of the directory, under the mutex.
+                unsafe { entries.add(i).write_volatile(0) };
+            }
+            Self::Card { mapped, mirror, .. } => {
+                mirror[i] = 0;
+                // SAFETY: inside the GPU upload mapping, under the mutex.
+                unsafe { mapped.add(i).write_volatile(0) };
+            }
+        }
+    }
+
+    fn mark_written(&self, page: u64) {
+        if let Self::Shadow { entries, .. } = self {
+            debug_assert!(page < u64::from(MEMORY_PAGES));
+            // SAFETY: inside the directory mapping.
+            let addr = unsafe { entries.add(page as usize * 2) } as usize;
+            crate::watch::wrote(addr, 8);
+        }
+    }
+
+    fn bring_up(&self, list: &HostList) {
+        if let Self::Shadow { shadow, .. } = self {
+            let (start, len) = shadow.span();
+            shadow.refresh(list, start, len);
+        }
+    }
+
+    fn keep_on(&self, list: &HostList) {
+        if let Self::Card { buffer, .. } = self {
+            list.keep(buffer);
+        }
+    }
+
+    fn gpu(&self) -> u64 {
+        match self {
+            Self::Shadow { shadow, .. } => shadow.gpu(shadow.span().0),
+            Self::Card { gpu, .. } => *gpu,
+        }
+    }
+}
+
 struct Memory {
     /// The CPU's entries (number, offset), and the copy shaders read.
-    directory: (*mut u32, Arc<Shadow>),
+    directory: Directory,
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
@@ -223,10 +328,29 @@ impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
         let bytes = u64::from(MEMORY_PAGES) * 8;
-        // Zeroed, and watched for writes as the title's memory is.
-        let entries = crate::upload::reserve(bytes as usize)?;
-        let directory = crate::shadow::by_address(entries as u64, bytes)?;
-        crate::host::name(&directory.buffer, || "title memory by address: directory".into());
+        let directory = if let Some((buffer, data)) = host.table_on_card_buffer(bytes) {
+            crate::host::name(&buffer, || "title memory by address: directory (card)".into());
+            // SAFETY: a fresh mapping of that many bytes; a live buffer.
+            let gpu = unsafe {
+                std::ptr::write_bytes(data, 0, bytes as usize);
+                buffer.GetGPUVirtualAddress()
+            };
+            Directory::Card {
+                buffer,
+                mapped: data.cast::<u32>(),
+                gpu,
+                mirror: vec![0; MEMORY_PAGES as usize * 2],
+            }
+        } else {
+            // Zeroed, and watched for writes as the title's memory is.
+            let entries = crate::upload::reserve(bytes as usize)?;
+            let shadow = crate::shadow::by_address(entries as u64, bytes)?;
+            crate::host::name(&shadow.buffer, || "title memory by address: directory".into());
+            Directory::Shadow {
+                entries: entries as *mut u32,
+                shadow,
+            }
+        };
         let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
@@ -235,7 +359,7 @@ impl Memory {
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
-            directory: (entries as *mut u32, directory),
+            directory,
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
             numbers: HashMap::new(),
@@ -261,20 +385,12 @@ impl Memory {
         })
     }
 
-    /// The directory's entry of `page`.
-    fn entry(&self, page: u64) -> *mut u32 {
-        debug_assert!(page < u64::from(MEMORY_PAGES));
-        // SAFETY: inside the directory.
-        unsafe { self.directory.0.add(page as usize * 2) }
-    }
-
     /// The place in `copies` of the copy that holds `page`, if one does.
     fn copy_of(&self, page: u64) -> Option<usize> {
         if page >= u64::from(MEMORY_PAGES) {
             return None;
         }
-        // SAFETY: an entry of the directory.
-        ((unsafe { self.entry(page).read() } & !MEMORY_READ_ONLY) as usize).checked_sub(1)
+        ((self.directory.read(page) & !MEMORY_READ_ONLY) as usize).checked_sub(1)
     }
 
     /// Whether `page` can be given a place: in the directory, not turned down
@@ -343,17 +459,15 @@ impl Memory {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    let entry = self.entry(at / PAGE);
-                    // SAFETY: an entry of the directory.
-                    if unsafe { entry.read() } == 0 {
-                        close(entry, n, at - first);
+                    let p = at / PAGE;
+                    if self.directory.read(p) == 0 {
+                        self.directory.close(p, n, at - first);
                     }
                     at += PAGE;
                 }
             }
-            // SAFETY: as above.
-            if unsafe { self.entry(page).read() } == 0 {
-                close(self.entry(page), n, start - shadow.span().0);
+            if self.directory.read(page) == 0 {
+                self.directory.close(page, n, start - shadow.span().0);
             }
             return true;
         }
@@ -364,7 +478,7 @@ impl Memory {
                 && let Some(n) = self.number(shadow)
             {
                 self.windows += 1;
-                fill(self.entry(page), n, 0);
+                self.directory.fill(page, n, 0);
                 return true;
             }
             return false;
@@ -406,7 +520,8 @@ impl Memory {
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
         self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
         self.order.push(page);
-        fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+        let offset = at as u64 - self.copies[copy].span().0;
+        self.directory.fill(page, copy, offset);
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
@@ -419,8 +534,7 @@ impl Memory {
             if held.owners == 0 && held.theirs {
                 self.free.push((held.copy, held.at));
                 self.pages.remove(&page);
-                // SAFETY: an entry of the directory, under the mutex.
-                unsafe { self.entry(page).write_volatile(0) };
+                self.directory.clear(page);
             }
         }
         self.stats.gone += 1;
@@ -482,7 +596,7 @@ impl Memory {
         );
         for page in first.div_ceil(PAGE)..(first + len) / PAGE {
             if self.copy_of(page) == Some(n) {
-                fill(self.entry(page), n, page * PAGE - first);
+                self.directory.fill(page, n, page * PAGE - first);
             }
         }
     }
@@ -625,7 +739,7 @@ impl Memory {
             return false;
         };
         self.hold(page, at, copy);
-        crate::watch::wrote(self.entry(page) as usize, 8);
+        self.directory.mark_written(page);
         self.take(page, 0, PAGE as usize, true);
         true
     }
@@ -744,8 +858,7 @@ impl Memory {
     /// Every copy is brought up to date when `list` is submitted, after what
     /// it deferred so far (once until a copy of the title's intervenes).
     fn bring_up(&self, list: &HostList) {
-        let (start, len) = self.directory.1.span();
-        self.directory.1.refresh(list, start, len);
+        self.directory.bring_up(list);
         for shadow in &self.copies {
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
@@ -840,20 +953,6 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
         }
     }
     asked
-}
-
-/// [`fill`] of a page stores by address do not reach.
-fn close(entry: *mut u32, n: usize, offset: u64) {
-    fill(entry, n | MEMORY_READ_ONLY as usize, offset);
-}
-
-/// The offset first: a shader that sees the number sees it too.
-fn fill(entry: *mut u32, n: usize, offset: u64) {
-    // SAFETY: an entry of the directory, under the mutex.
-    unsafe {
-        entry.add(1).write_volatile(offset as u32);
-        entry.write_volatile(n as u32 + 1);
-    }
 }
 
 /// The bytes of a packed structure whose first two dwords these are: the
@@ -1055,6 +1154,7 @@ pub(crate) fn ready(
     }
     if first_read {
         list.keep(&m.faults.0);
+        m.directory.keep_on(list);
         #[cfg(feature = "diagnostics")]
         m.dump(list, addresses);
     }
@@ -1062,9 +1162,8 @@ pub(crate) fn ready(
     if use_ == Use::Reads {
         m.dump.walked(addresses);
     }
-    let directory = &m.directory.1;
     Some(Ready {
-        directory: directory.gpu(directory.span().0),
+        directory: m.directory.gpu(),
         faults: m.faults.2,
         base,
     })

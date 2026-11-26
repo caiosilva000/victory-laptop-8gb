@@ -1533,13 +1533,29 @@ impl HostHeap {
         let strides = (!sampler)
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
-                let (buffer, data) = host.upload_buffer(bytes)?;
+                // With `VICTORY_TABLES_ON_CARD=1` (and VRAM headroom): in a GPU
+                // upload heap (the card's memory, written by the CPU through
+                // the bus, never read by the CPU); falls back to the old path
+                // when off or when the card has no room.
+                let (buffer, data, on_card) = match host.table_on_card_buffer(bytes) {
+                    Some((buffer, data)) => (buffer, data, true),
+                    None => {
+                        let (buffer, data) = host.upload_buffer(bytes)?;
+                        (buffer, data, false)
+                    }
+                };
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
+                crate::host::name(&buffer, || {
+                    if on_card {
+                        "element strides by view heap slot (card)".to_owned()
+                    } else {
+                        "element strides by view heap slot".to_owned()
+                    }
+                });
                 Some((buffer, gpu, data as usize))
             })
             .flatten();

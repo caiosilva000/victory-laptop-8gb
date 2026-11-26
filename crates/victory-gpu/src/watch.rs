@@ -1046,7 +1046,7 @@ pub(crate) fn opened_for_writing(at: usize) {
 fn publish(pages: &[usize]) {
     let g = guards();
     for &page in pages {
-        if g.clean.contains(page) || g.held.contains(page) {
+        if (g.clean.contains(page) && !g.arming.contains(page)) || g.held.contains(page) {
             PUBLISHED.set(page);
             // (Put there since: whoever did clears the bit after this is
             // set, or its own bit is found here.)
@@ -1387,6 +1387,12 @@ struct Guards {
     aliased: Blocks,
     /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// Blocks noted read-only and clean whose protection an asking is
+    /// changing outside the lock ([`Arming`]).
+    arming: Blocks,
+    /// Of those, the ones an opening, alias map, or remap met meanwhile:
+    /// made writable again when the asking is done.
+    disturbed: Blocks,
 }
 
 impl Guards {
@@ -1423,6 +1429,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    arming: Blocks::new(),
+    disturbed: Blocks::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1658,7 +1666,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let g = guards_timed();
-        if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+        if g.clean.range(first..last).count() == last - first
+            && !BESIDE.any(first, last)
+            && g.arming.range(first..last).next().is_none()
+        {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
             tally(3, 1);
@@ -1683,6 +1694,15 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let rest = rest();
     let mut g = guards_timed();
+    // Blocks of the range another asking is making read-only outside the
+    // lock ([`Arming`]): wait until they stand so a write landing before
+    // their guard cannot be missed.
+    while g.arming.range(first..last).next().is_some() {
+        g = ARMED.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    let hold_started = std::time::Instant::now();
+    let later = guard_outside();
+    let mut arming = Arming(Vec::new());
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
@@ -1698,17 +1718,35 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
+    let take_run = |g: &mut Guards, from: usize, to: usize, arming: &mut Arming| {
+        // Defer outside `GUARDS` when `VICTORY_GUARD_OUTSIDE` is on and no
+        // block in the run is shown at another address (`elsewhere` skips
+        // single-view registrations, fixing PR #1315's `views_between` check).
+        if later && (!view_guard() || elsewhere(from * BLOCK, (to - from) * BLOCK).is_empty()) {
+            #[cfg(feature = "diagnostics")]
+            crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+            (from..to).for_each(|b| PROTECTED.set(b));
+            g.protected.insert_all(from..to);
+            g.clean.insert_all(from..to);
+            g.arming.insert_all(from..to);
+            arming.0.push((from, to));
+        } else {
+            protect(g, from, to);
+        }
+    };
     let mut run: Option<(usize, usize)> = None;
     for &block in &written {
         if let Some((from, to)) = run
             && to != block
         {
-            protect(&mut g, from, to);
+            take_run(&mut g, from, to, &mut arming);
             run = None;
-            // Faults of the title's wait for the lock: each block is done on
-            // its own, and looked at anew below.
-            drop(g);
-            g = guards_timed();
+            if !later {
+                // Faults of the title's wait for the lock: each block is done on
+                // its own, and looked at anew below.
+                drop(g);
+                g = guards_timed();
+            }
         }
         // Told as written by this, and read by the caller after.
         if BESIDE.take(block) {
@@ -1719,7 +1757,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // because one could not be made so. (Or clean, and bytes were put
             // in beside the guard: it stays.)
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                take_run(&mut g, from, to, &mut arming);
             }
             if g.clean.contains(block) {
                 continue;
@@ -1730,16 +1768,187 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+            take_run(&mut g, from, to, &mut arming);
         }
     }
     if let Some((from, to)) = run {
-        protect(&mut g, from, to);
+        take_run(&mut g, from, to, &mut arming);
     }
+    GUARD_OUTSIDE_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GUARD_OUTSIDE_STATS[3].fetch_add(
+        hold_started.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     drop(g);
+    arming.finish();
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     Some(written)
+}
+
+/// Signalled when an asking's deferred blocks finish [`Arming::finish`].
+static ARMED: Condvar = Condvar::new();
+
+/// Tests: [`guard_outside`] as the environment says (0), off (1), on (2).
+#[cfg(test)]
+pub(crate) static GUARD_OUTSIDE_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Since the last frame-rate line, of [`guard_outside`]:
+/// `[0]` `VirtualProtect` calls outside `GUARDS`, `[1]` blocks protected
+/// outside `GUARDS`, `[2]` `guard()` lock holds, `[3]` nanoseconds held.
+static GUARD_OUTSIDE_STATS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Per-frame proof-of-activation line for `VICTORY_GUARD_OUTSIDE` (PR #1315).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_outside_stats(frames: f64) -> String {
+    let [calls, blocks, holds, hold_ns] =
+        [0, 1, 2, 3].map(|i| GUARD_OUTSIDE_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let on = u8::from(guard_outside());
+    format!(
+        "guard_outside(VICTORY_GUARD_OUTSIDE={on}): {:.1} outside protects ({:.1} blocks), {:.0} guard lock holds ({:.2} ms held)",
+        calls as f64 / frames,
+        blocks as f64 / frames,
+        holds as f64 / frames,
+        hold_ns as f64 / 1e6 / frames,
+    )
+}
+
+/// Whether [`guard`] makes dirty non-aliased blocks read-only outside the
+/// `GUARDS` lock (`VICTORY_GUARD_OUTSIDE=1` or `alt`; default OFF, PR #1315).
+fn guard_outside() -> bool {
+    #[cfg(test)]
+    match GUARD_OUTSIDE_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GUARD_OUTSIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                / 20)
+                % 2
+                == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "guards outside lock (VICTORY_GUARD_OUTSIDE=alt): {}",
+                    if on { "ON" } else { "off" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Runs of blocks `[from, to)` noted read-only, clean, and in `Guards::arming`
+/// whose `VirtualProtect` runs outside `GUARDS` ([`guard_outside`]).
+#[must_use]
+struct Arming(Vec<(usize, usize)>);
+
+impl Arming {
+    fn finish(mut self) {
+        Self::arm(std::mem::take(&mut self.0));
+    }
+
+    fn arm(runs: Vec<(usize, usize)>) {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+        if runs.is_empty() {
+            return;
+        }
+        let set = |from: usize, to: usize| {
+            let mut old = 0;
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            // SAFETY: title view memory; only its protection changes.
+            let mut done = unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (to - from) * BLOCK,
+                    PAGE_READONLY,
+                    &mut old,
+                ) != 0
+            };
+            if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+                // SAFETY: not ours to guard; restore previous protection.
+                unsafe {
+                    VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old)
+                };
+                done = false;
+            }
+            GUARD_OUTSIDE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            GUARD_OUTSIDE_STATS[1].fetch_add((to - from) as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                tally(5, (to - from) as u64);
+                tally(8, started.elapsed().as_nanos() as u64);
+            }
+            done
+        };
+        let mut failed: Vec<(usize, bool, bool)> = Vec::new();
+        for &(from, to) in &runs {
+            if set(from, to) {
+                continue;
+            }
+            let mut uncommitted_until = from;
+            for block in from..to {
+                if block >= uncommitted_until && set(block, block + 1) {
+                    continue;
+                }
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                    #[cfg(feature = "diagnostics")]
+                    tally(9, 1);
+                }
+                let absent = block < uncommitted_until;
+                let held = absent && known_holes() && placeholder(block);
+                failed.push((block, absent, held));
+            }
+        }
+        let mut g = guards();
+        for &(block, absent, held) in &failed {
+            g.protected.remove(block);
+            g.clean.remove(block);
+            PROTECTED.clear(block);
+            if !g.disturbed.contains(block) && absent {
+                g.absent.insert(block);
+                if held {
+                    g.held.insert(block);
+                }
+            }
+        }
+        for &(from, to) in &runs {
+            for block in from..to {
+                g.arming.remove(block);
+                if g.disturbed.remove(block) {
+                    g.protected.remove(block);
+                    g.clean.remove(block);
+                    PUBLISHED.clear(block);
+                    unguard_one(block);
+                }
+            }
+        }
+        drop(g);
+        ARMED.notify_all();
+    }
+}
+
+impl Drop for Arming {
+    fn drop(&mut self) {
+        Self::arm(std::mem::take(&mut self.0));
+    }
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -1974,6 +2183,17 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
         return 0;
     }
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
+    if g.arming.range(first..last).next().is_some() {
+        // Being made read-only outside `GUARDS` ([`Arming`]): open it now and
+        // mark it disturbed so [`Arming::finish`] leaves it writable.
+        let arming: Vec<usize> = g.arming.range(first..last).collect();
+        for &block in &arming {
+            g.disturbed.insert(block);
+        }
+        blocks.extend(arming);
+        blocks.sort_unstable();
+        blocks.dedup();
+    }
     let here = blocks.len();
     let aliased: Vec<usize> = g.aliased.range(first..last).collect();
     if !aliased.is_empty() {
@@ -2306,8 +2526,21 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     // together: none may be writable while another is clean (who asks about
     // that one by its bits takes no lock).
     let mut g = guards();
-    let blocks: Vec<usize> =
+    let mut blocks: Vec<usize> =
         ranges.iter().flat_map(|&(at, n)| g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect::<Vec<_>>()).collect();
+    let mut any_arming = false;
+    for &(at, n) in &ranges {
+        let arming: Vec<usize> = g.arming.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect();
+        for block in arming {
+            g.disturbed.insert(block);
+            blocks.push(block);
+            any_arming = true;
+        }
+    }
+    if any_arming {
+        blocks.sort_unstable();
+        blocks.dedup();
+    }
     #[cfg(feature = "diagnostics")]
     ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
     unguard(&mut g, &blocks);
@@ -2589,7 +2822,12 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 pub fn title_memory_freed(at: usize, len: usize) {
     let mut g = guards();
     let first = at / BLOCK;
-    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
+    let noted = [
+        g.protected.range(first..).next(),
+        g.arming.range(first..).next(),
+        g.absent.range(first..).next(),
+        g.foreign.range(first..).next().copied(),
+    ];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
     };
@@ -2660,9 +2898,13 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     for block in foreign {
         g.foreign.remove(&block);
     }
-    let aliased: Vec<usize> = g.aliased.range(range).collect();
+    let aliased: Vec<usize> = g.aliased.range(range.clone()).collect();
     for block in aliased {
         g.aliased.remove(block);
+    }
+    let arming: Vec<usize> = g.arming.range(range).collect();
+    for block in arming {
+        g.disturbed.insert(block);
     }
     g
 }
@@ -4662,6 +4904,224 @@ mod batch_open_tests {
                     Value: view as *mut _,
                 },
             );
+        }
+    }
+
+    /// PR #1315 + CuteBooty review fix: `VICTORY_GUARD_OUTSIDE` defaults OFF;
+    /// when OFF it uses the old under-lock path; when ON it defers
+    /// `VirtualProtect` outside `GUARDS` even for registered single-view memory
+    /// (unlike PR #1315's `views_between` check), and interoperates with
+    /// `VICTORY_BATCH_OPEN=1`.
+    #[test]
+    fn guard_outside_defaults_off_and_defers_registered_single_view() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        if std::env::var_os("VICTORY_GUARD_OUTSIDE").is_none() {
+            GUARD_OUTSIDE_TEST.store(0, Relaxed);
+            assert!(!guard_outside(), "VICTORY_GUARD_OUTSIDE must default OFF");
+        }
+        const BLOCKS: usize = 4;
+        // SAFETY: a pagefile section of 4 blocks, mapped read-write.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (BLOCKS * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCKS * BLOCK).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        // Register as a single view (the real game path in `xmem::map`).
+        crate::inplace::title_memory_view(view, BLOCKS * BLOCK, section as usize, 0);
+
+        // OFF: old under-lock path does not increment outside-protect counter.
+        GUARD_OUTSIDE_TEST.store(1, Relaxed);
+        let before_off = GUARD_OUTSIDE_STATS[0].load(Relaxed);
+        assert!(guard(view, view + BLOCKS * BLOCK).is_some());
+        assert_eq!(
+            GUARD_OUTSIDE_STATS[0].load(Relaxed),
+            before_off,
+            "OFF must stay under GUARDS lock"
+        );
+        for i in 0..BLOCKS {
+            assert!(!writable(view + i * BLOCK), "block {i} guarded (OFF)");
+        }
+        writing(view, BLOCKS * BLOCK);
+
+        // ON: registered single-view memory takes the outside path.
+        GUARD_OUTSIDE_TEST.store(2, Relaxed);
+        let before_on = GUARD_OUTSIDE_STATS[0].load(Relaxed);
+        assert!(guard(view, view + BLOCKS * BLOCK).is_some());
+        assert!(
+            GUARD_OUTSIDE_STATS[0].load(Relaxed) > before_on,
+            "ON must defer VirtualProtect outside GUARDS for single-view memory"
+        );
+        for i in 0..BLOCKS {
+            assert!(!writable(view + i * BLOCK), "block {i} guarded (ON)");
+        }
+
+        // Combined with VICTORY_BATCH_OPEN=1: opens all 4 blocks in one call.
+        TEST_BATCH_OPEN.with(|c| c.set(Some(true)));
+        TEST_OPEN_CALLS.with(|c| c.set(0));
+        writing(view, BLOCKS * BLOCK);
+        assert_eq!(TEST_OPEN_CALLS.with(|c| c.get()), 1, "batch open works with guard_outside");
+        for i in 0..BLOCKS {
+            assert!(writable(view + i * BLOCK), "block {i} writable after batch open");
+        }
+        TEST_BATCH_OPEN.with(|c| c.set(None));
+        GUARD_OUTSIDE_TEST.store(0, Relaxed);
+        title_memory_unmapping(view, BLOCKS * BLOCK);
+        // SAFETY: our view and section.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            );
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    /// Ported from PR #1315 (`flushes_under_writes_lose_nothing`): concurrent
+    /// title writes faulting against guarded views while refreshes run with
+    /// `VICTORY_GUARD_OUTSIDE` OFF and ON lose no write and never go backwards.
+    #[test]
+    fn guard_outside_concurrent_writes_lose_nothing() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        const BLOCKS: usize = 16;
+        const WRITERS: usize = 2;
+        const SLOTS: usize = 32;
+        const LEN: usize = BLOCKS * BLOCK;
+        // SAFETY: a pagefile section of 16 blocks, mapped read-write.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        let slot = |w: usize, i: usize| -> usize {
+            let block = (i * 7 + w * 5) % BLOCKS;
+            view + block * BLOCK + (w * SLOTS + i) * 16 % (BLOCK - 8)
+        };
+        let written: Vec<Vec<AtomicU64>> = (0..WRITERS)
+            .map(|_| (0..SLOTS).map(|_| AtomicU64::new(0)).collect())
+            .collect();
+        let latest: Vec<AtomicU64> = (0..WRITERS).map(|_| AtomicU64::new(0)).collect();
+        let mut shadow = vec![0u8; LEN];
+        let mut copied = vec![0u64; LEN / PAGE];
+
+        for outside in [false, true] {
+            GUARD_OUTSIDE_TEST.store(if outside { 2 } else { 1 }, Relaxed);
+            // Prime guards & shadow.
+            let (now, _) = writes(view, view + LEN, true).expect("view memory");
+            // SAFETY: readable view memory we mapped.
+            shadow.copy_from_slice(unsafe { std::slice::from_raw_parts(view as *const u8, LEN) });
+            copied.fill(now);
+            let mut held = vec![0u64; WRITERS * SLOTS];
+            for w in 0..WRITERS {
+                for i in 0..SLOTS {
+                    let off = slot(w, i) - view;
+                    held[w * SLOTS + i] = u64::from_le_bytes(shadow[off..off + 8].try_into().unwrap());
+                }
+            }
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                for (w, mine) in written.iter().enumerate() {
+                    let (stop, latest) = (&stop, &latest[w]);
+                    s.spawn(move || {
+                        let mut n = latest.load(Relaxed);
+                        let mut state = 0xfeed_u64 + w as u64;
+                        while !stop.load(Relaxed) {
+                            n += 1;
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            let i = (state as usize) % SLOTS;
+                            latest.store(n, Release);
+                            // SAFETY: inside our mapped view; VEH opens guarded blocks.
+                            unsafe { (slot(w, i) as *mut u64).write_volatile(n) };
+                            mine[i].store(n, Release);
+                            if n % 32 == 0 {
+                                std::thread::yield_now();
+                            }
+                        }
+                    });
+                }
+                for _ in 0..40 {
+                    let floor: Vec<u64> = written
+                        .iter()
+                        .flat_map(|w| w.iter().map(|v| v.load(Acquire)))
+                        .collect();
+                    let (now, dirty) = writes(view, view + LEN, true).expect("view memory");
+                    for (page, stamp) in dirty {
+                        let idx = page - view / PAGE;
+                        if stamp > copied[idx] {
+                            let off = idx * PAGE;
+                            // SAFETY: readable view memory we mapped.
+                            let src = unsafe { std::slice::from_raw_parts((view + off) as *const u8, PAGE) };
+                            shadow[off..off + PAGE].copy_from_slice(src);
+                            copied[idx] = now;
+                        }
+                    }
+                    let ceiling: Vec<u64> = latest.iter().map(|v| v.load(Acquire)).collect();
+                    for w in 0..WRITERS {
+                        for i in 0..SLOTS {
+                            let k = w * SLOTS + i;
+                            let off = slot(w, i) - view;
+                            let val = u64::from_le_bytes(shadow[off..off + 8].try_into().unwrap());
+                            assert!(val >= floor[k], "outside {outside}: lost write ({val} < {})", floor[k]);
+                            assert!(val <= ceiling[w], "outside {outside}: future value ({val} > {})", ceiling[w]);
+                            assert!(val >= held[k], "outside {outside}: went back ({val} < {})", held[k]);
+                            held[k] = val;
+                        }
+                    }
+                }
+                stop.store(true, Relaxed);
+            });
+            // Quiet flush: shadow must match title memory byte-for-byte.
+            let (now, dirty) = writes(view, view + LEN, true).expect("view memory");
+            for (page, stamp) in dirty {
+                let idx = page - view / PAGE;
+                if stamp > copied[idx] {
+                    let off = idx * PAGE;
+                    // SAFETY: readable view memory we mapped.
+                    let src = unsafe { std::slice::from_raw_parts((view + off) as *const u8, PAGE) };
+                    shadow[off..off + PAGE].copy_from_slice(src);
+                    copied[idx] = now;
+                }
+            }
+            // SAFETY: readable view memory we mapped.
+            let live = unsafe { std::slice::from_raw_parts(view as *const u8, LEN) };
+            assert_eq!(shadow, live, "outside {outside}: shadow differs after quiet flush");
+        }
+        GUARD_OUTSIDE_TEST.store(0, Relaxed);
+        title_memory_unmapping(view, LEN);
+        // SAFETY: our view and section.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            );
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 }

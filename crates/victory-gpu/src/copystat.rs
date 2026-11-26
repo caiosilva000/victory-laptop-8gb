@@ -1218,6 +1218,14 @@ pub(crate) fn log(frames: f64) {
         mb(vram_b as f64),
         mb(ram_b as f64),
     );
+    let [tbl_n, tbl_b, tbl_room, tbl_unsup, tbl_err] =
+        [0, 1, 2, 3, 4].map(|i| crate::host::TABLES_STATS[i].load(Relaxed));
+    let tbl_fb = tbl_room + tbl_unsup + tbl_err;
+    tracing::info!(
+        "tables on card (VICTORY_TABLES_ON_CARD={}): {tbl_n} on card ({:.1} MB), {tbl_fb} fell back ({tbl_room} no room, {tbl_unsup} unsupported, {tbl_err} error)",
+        u8::from(crate::host::tables_on_card()),
+        mb(tbl_b as f64),
+    );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
@@ -1254,6 +1262,10 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
+    );
+    tracing::info!(
+        "guard outside lock per frame: {}",
+        crate::watch::guard_outside_stats(frames as f64)
     );
     tracing::info!(
         "ported guard/tex fast paths per frame: {}; {}",

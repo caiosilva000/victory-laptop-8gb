@@ -807,6 +807,14 @@ pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::
 /// `[6]` fell back: allocation or map error.
 pub(crate) static UPLOAD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Shader table placements since the start (`VICTORY_TABLES_ON_CARD=1`,
+/// `Host::table_on_card_buffer`):
+/// `[0]` on-card count, `[1]` on-card bytes,
+/// `[2]` fell back: no room (VRAM >= limit or unknown),
+/// `[3]` fell back: unsupported (`GPUUploadHeapSupported` false),
+/// `[4]` fell back: allocation or map error.
+pub(crate) static TABLES_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// What of that is alive now, for the memory line (`MADE` counts what was
 /// ever made: 42,607 upload buffers, 77.9 GB, in five minutes of run 60,
 /// and nothing said how many were alive): host lists; the lists' scratch
@@ -1132,6 +1140,77 @@ mod tests {
         assert_eq!(
             choose_upload_placement(true, || true, || upload_vram_fits(4_000_000_000, 7_250_000_000, 64 << 10)),
             UploadPlacement::VideoMemory
+        );
+    }
+
+    #[test]
+    fn tables_on_card_env_defaults_off() {
+        assert!(!super::parse_tables_on_card_env(None));
+        for off in ["", "0", "false", "FALSE", "off", "no", "maybe"] {
+            assert!(!super::parse_tables_on_card_env(Some(off)), "{off:?}");
+        }
+        for on in ["1", " 1 ", "true", "TRUE", "on", "yes"] {
+            assert!(super::parse_tables_on_card_env(Some(on)), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn tables_vram_fits_checks_headroom_for_8gb_card() {
+        // Unknown or zero budget must never allocate on card.
+        assert!(!super::tables_vram_fits(0, 0, 8 << 20, 90));
+        // 8 GB laptop card (~7.25 GB DXGI budget): 85% full fits 8 MiB strides + 16 MiB directory under 90%.
+        let budget = 7_250_000_000u64;
+        assert!(super::tables_vram_fits(budget * 85 / 100, budget, 8 << 20, 90));
+        assert!(super::tables_vram_fits(budget * 88 / 100, budget, 16 << 20, 90));
+        // At 90% full (or when adding the table crosses 90%), refuse and fall back.
+        assert!(!super::tables_vram_fits(budget * 90 / 100, budget, 8 << 20, 90));
+        assert!(!super::tables_vram_fits(budget * 89 / 100, budget, 100 << 20, 90));
+        // Overflow safety.
+        assert!(!super::tables_vram_fits(u64::MAX, budget, 1, 90));
+    }
+
+    #[test]
+    fn tables_on_card_placement_defaults_off_and_falls_back_when_no_room() {
+        use super::{TablePlacement, choose_table_placement, tables_vram_fits};
+        let mut probed_support = false;
+        let mut probed_headroom = false;
+        assert_eq!(
+            choose_table_placement(
+                false,
+                || {
+                    probed_support = true;
+                    true
+                },
+                || {
+                    probed_headroom = true;
+                    true
+                },
+            ),
+            TablePlacement::Disabled
+        );
+        assert!(
+            !probed_support && !probed_headroom,
+            "disabled VICTORY_TABLES_ON_CARD must take old path without VRAM probes"
+        );
+        assert_eq!(
+            choose_table_placement(true, || false, || unreachable!()),
+            TablePlacement::FallbackUnsupported
+        );
+        assert_eq!(
+            choose_table_placement(
+                true,
+                || true,
+                || tables_vram_fits(6_600_000_000, 7_250_000_000, 8 << 20, 90)
+            ),
+            TablePlacement::FallbackNoRoom
+        );
+        assert_eq!(
+            choose_table_placement(
+                true,
+                || true,
+                || tables_vram_fits(6_200_000_000, 7_250_000_000, 8 << 20, 90)
+            ),
+            TablePlacement::Card
         );
     }
 
@@ -3160,8 +3239,12 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let started = std::time::Instant::now();
+        let budget = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = budget;
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let avoided_settle = crate::shadow::merge_defer() && runs_left == 0 && spans.is_empty();
+        crate::shadow::note_merge_defer_submission(started.elapsed().as_micros() as u64, avoided_settle);
         return spans;
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
@@ -3700,7 +3783,7 @@ fn late_line(frames: f64) {
         s[13],
         s[14],
     );
-    {
+    let stale_wait_ms = {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
@@ -3716,7 +3799,8 @@ fn late_line(frames: f64) {
             w[WHY_WRITES],
             w[WHY_FENCE],
         );
-    }
+        w[WHY_STALE]
+    };
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -3769,10 +3853,21 @@ fn late_line(frames: f64) {
     log_blame(frames);
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [def_pages, def_runs, def_settles, merge_us] = crate::shadow::merge_defer_stats().map(|n| n as f64 / frames);
+        let on = u8::from(crate::shadow::merge_defer());
+        let avoided_wait_ms = if s[WHY_STALE] > 0.0 && def_settles > 0.0 {
+            // Average observed WHY_STALE settle time * avoided settles.
+            (stale_wait_ms / s[WHY_STALE]) * def_settles
+        } else {
+            0.0
+        };
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; merge_defer(VICTORY_MERGE_DEFER={on}): {def_pages:.0} deferred slices \
+             ({def_runs:.0} over-budget runs), {def_settles:.1} settles avoided ({avoided_wait_ms:.2} ms avoided wait), \
+             {:.2} ms merge",
+            bytes / (1 << 20) as f64,
+            merge_us / 1000.0
         );
     }
 }
@@ -8916,6 +9011,47 @@ impl Host {
             }
         }
     }
+
+    /// With `VICTORY_TABLES_ON_CARD=1`, allocates a shader-read table (element
+    /// strides or address directory) in a GPU upload heap (card memory via
+    /// Resizable BAR) while local VRAM has headroom; otherwise returns `None`
+    /// so the caller falls back to the old path without risking device loss.
+    pub(crate) fn table_on_card_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        match choose_table_placement(
+            tables_on_card(),
+            || self.mapped_card_memory(),
+            || self.tables_vram_has_headroom(size),
+        ) {
+            TablePlacement::Card => {
+                if let Some(made) = self.upload_vram_buffer(size) {
+                    MADE[4].fetch_add(1, Ordering::Relaxed);
+                    MADE[5].fetch_add(size, Ordering::Relaxed);
+                    self.note_upload_vram(size);
+                    TABLES_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    TABLES_STATS[1].fetch_add(size, Ordering::Relaxed);
+                    return Some(made);
+                }
+                TABLES_STATS[4].fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            TablePlacement::Disabled => None,
+            TablePlacement::FallbackNoRoom => {
+                TABLES_STATS[2].fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            TablePlacement::FallbackUnsupported => {
+                TABLES_STATS[3].fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn tables_vram_has_headroom(&self, size: u64) -> bool {
+        let Some([budget, used, ..]) = self.video_memory() else {
+            return false;
+        };
+        tables_vram_fits(used, budget, size, tables_on_card_percent())
+    }
 }
 
 /// Whether `Host::upload_buffer` tries `D3D12_HEAP_TYPE_GPU_UPLOAD` (VRAM via
@@ -8978,6 +9114,70 @@ fn choose_upload_placement(
         return UploadPlacement::SystemFallbackNoRoom;
     }
     UploadPlacement::VideoMemory
+}
+
+fn parse_tables_on_card_env(val: Option<&str>) -> bool {
+    parse_upload_vram_env(val)
+}
+
+/// `VICTORY_TABLES_ON_CARD=1`: place the element strides table and the address
+/// directory in GPU upload heaps (the card's own memory) when VRAM has room.
+/// Off by default; read once, logged once.
+pub(crate) fn tables_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_tables_on_card_env(std::env::var("VICTORY_TABLES_ON_CARD").ok().as_deref());
+        if on {
+            tracing::info!(
+                percent = tables_on_card_percent(),
+                "VICTORY_TABLES_ON_CARD=1: strides table and address directory try GPU upload heaps"
+            );
+        }
+        on
+    })
+}
+
+/// Maximum local VRAM share (%) for `VICTORY_TABLES_ON_CARD=1`
+/// (`VICTORY_TABLES_ON_CARD_PERCENT`, 10-98, 90 by default).
+fn tables_on_card_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TABLES_ON_CARD_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(90, |p| p.clamp(10, 98))
+    })
+}
+
+fn tables_vram_fits(local_used_bytes: u64, local_budget_bytes: u64, size: u64, percent: u64) -> bool {
+    local_budget_bytes > 0
+        && local_used_bytes.saturating_add(size)
+            <= local_budget_bytes / 100 * percent + (local_budget_bytes % 100) * percent / 100
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TablePlacement {
+    Card,
+    Disabled,
+    FallbackNoRoom,
+    FallbackUnsupported,
+}
+
+fn choose_table_placement(
+    enabled: bool,
+    gpu_upload_supported: impl FnOnce() -> bool,
+    has_headroom: impl FnOnce() -> bool,
+) -> TablePlacement {
+    if !enabled {
+        return TablePlacement::Disabled;
+    }
+    if !gpu_upload_supported() {
+        return TablePlacement::FallbackUnsupported;
+    }
+    if !has_headroom() {
+        return TablePlacement::FallbackNoRoom;
+    }
+    TablePlacement::Card
 }
 
 /// The swap chain formats a presented texture can be copied into: its own

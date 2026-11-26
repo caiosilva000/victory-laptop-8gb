@@ -1989,6 +1989,44 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Whether over-budget merges under pending shader writes (`runs_left`
+/// exhausted in [`Shadow::merge_under_writes`]) are deferred to the next
+/// submission instead of forcing a `WHY_STALE` settle
+/// (`VICTORY_MERGE_DEFER=1`, default OFF).
+pub(crate) fn merge_defer() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_MERGE_DEFER.with(|c| c.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_MERGE_DEFER"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Optional per-thread override for [`merge_defer`] in unit tests.
+    static TEST_MERGE_DEFER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Since the last frame-rate line, of [`merge_defer`]:
+/// `[0]` deferred pages/slices, `[1]` over-budget runs that triggered defer,
+/// `[2]` settles avoided, `[3]` microseconds spent in `merge_under_writes`.
+static MERGED_DEFER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Records microseconds spent in [`Shadow::merge_under_writes`] for a submission
+/// and whether a `WHY_STALE` settle was avoided by [`merge_defer`].
+pub(crate) fn note_merge_defer_submission(us: u64, avoided_settle: bool) {
+    MERGED_DEFER[3].fetch_add(us, Ordering::Relaxed);
+    if avoided_settle {
+        MERGED_DEFER[2].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// [`MERGED_DEFER`], taken.
+pub(crate) fn merge_defer_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGED_DEFER[i].swap(0, Ordering::Relaxed))
+}
+
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -3547,13 +3585,19 @@ impl Shadow {
             note_stale(0);
             return true;
         }
+        let defer = merge_defer();
+        if defer && self.card.is_some() && *runs_left == 0 {
+            let pages: u64 = busy.iter().map(|&(a, e)| e.div_ceil(PAGE).saturating_sub(a / PAGE) as u64).sum();
+            MERGED_DEFER[0].fetch_add(pages.max(1), Ordering::Relaxed);
+            return false;
+        }
         // The declared ranges overlap (views of the title's whole heap from
         // dozens of offsets): as one range each page is asked about and
         // compared once. Every byte of it is in a declared range, and of a
         // copy in the PC's memory in the snapshot.
         let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
-        for (a, e) in busy {
+        for (busy_i, &(a, e)) in busy.iter().enumerate() {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
@@ -3596,6 +3640,7 @@ impl Shadow {
             type Done = Option<Vec<(usize, usize)>>;
             let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
             let over = std::sync::atomic::AtomicBool::new(false);
+            let over_runs = AtomicU64::new(0);
             let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
             let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
             let one = |i: usize| {
@@ -3608,7 +3653,10 @@ impl Shadow {
                     let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
                     match runs {
                         Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
-                        Err(()) => over.store(true, Ordering::Relaxed),
+                        Err(copies) => {
+                            over.store(true, Ordering::Relaxed);
+                            over_runs.fetch_add(copies as u64, Ordering::Relaxed);
+                        }
                     }
                 }
             };
@@ -3621,10 +3669,12 @@ impl Shadow {
             }
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            let mut merged_pages = 0usize;
             for (i, runs) in done.into_iter().enumerate() {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
                 };
+                merged_pages += 1;
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
@@ -3647,6 +3697,17 @@ impl Shadow {
                 }
             }
             if over.into_inner() {
+                if defer {
+                    let rest_pages: u64 = busy[busy_i + 1..]
+                        .iter()
+                        .map(|&(ra, re)| re.div_ceil(PAGE).saturating_sub(ra / PAGE) as u64)
+                        .sum();
+                    let skipped = stale.len().saturating_sub(merged_pages) as u64 + rest_pages;
+                    MERGED_DEFER[0].fetch_add(skipped.max(1), Ordering::Relaxed);
+                    MERGED_DEFER[1].fetch_add(over_runs.into_inner(), Ordering::Relaxed);
+                    *runs_left = 0;
+                    return false;
+                }
                 note_stale(2);
                 return true;
             }
@@ -3656,8 +3717,8 @@ impl Shadow {
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
     /// page, compared with the reference, which begins at `held`, and put in.
-    /// The runs that changed, none if it cannot be read, and an error if
-    /// there were more to copy one by one than `left`.
+    /// The runs that changed, none if it cannot be read, and an error with the
+    /// overflowing copy count if there were more to copy one by one than `left`.
     ///
     /// # Safety
     /// The reference holds the copy's length, and nothing else writes these
@@ -3668,7 +3729,7 @@ impl Shadow {
         n: usize,
         held: *mut u8,
         left: &std::sync::atomic::AtomicI64,
-    ) -> Result<Option<Vec<(usize, usize)>>, ()> {
+    ) -> Result<Option<Vec<(usize, usize)>>, usize> {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -3689,7 +3750,7 @@ impl Shadow {
                 let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
                 let copies = runs.iter().filter(own).count() as i64;
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
-                    return Err(());
+                    return Err(copies as usize);
                 }
                 let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
                 for &(r, m) in &runs {
@@ -4781,6 +4842,84 @@ mod land_tests {
             let last = writer.join().expect("nothing undone");
             assert!((1..LEN / 4).step_by(4 * 331).all(|i| dword(i).load(Ordering::Relaxed) == last));
         });
+    }
+
+    /// `VICTORY_MERGE_DEFER` defaults OFF: when OFF, running out of `runs_left`
+    /// returns `true` (triggers `WHY_STALE` settle); when ON, over-budget pages
+    /// are deferred (returns `false`, increments counters) and merged cleanly
+    /// on the next call with fresh budget.
+    #[test]
+    fn merge_defer_defaults_off_and_defers_over_budget_when_on() {
+        use super::{MERGED_DEFER, PAGE, TEST_MERGE_DEFER, merge_defer};
+        if std::env::var_os("VICTORY_MERGE_DEFER").is_none() {
+            TEST_MERGE_DEFER.with(|c| c.set(None));
+            assert!(!merge_defer(), "VICTORY_MERGE_DEFER must default OFF");
+        }
+        const LEN: usize = 2 * PAGE;
+        let title = memory(LEN, true);
+        let Some(shadow) = copy_of(title, LEN) else {
+            return; // no host GPU
+        };
+        shadow.pending.lock().unwrap().push((title, title + LEN));
+        // Write 8 non-contiguous 300-byte runs (> 256 B word-scatter cap) across
+        // page 0 and page 1 so each counts as its own copy against `runs_left`.
+        for p in 0..2 {
+            for k in 0..4 {
+                let off = p * PAGE + k * 512;
+                // SAFETY: committed write-watched memory we allocated.
+                unsafe {
+                    std::slice::from_raw_parts_mut((title + off) as *mut u8, 300)
+                        .fill((p * 10 + k + 1) as u8);
+                }
+            }
+        }
+
+        // OFF (default old path): budget of 2 runs is exceeded -> returns true (settle).
+        TEST_MERGE_DEFER.with(|c| c.set(Some(false)));
+        let mut runs = 2;
+        assert!(
+            shadow.merge_under_writes(title, LEN, &mut runs),
+            "OFF must request settle when runs_left is exhausted"
+        );
+
+        // Write fresh 300-byte runs on both pages so both are stale again.
+        for p in 0..2 {
+            for k in 0..4 {
+                let off = p * PAGE + k * 512;
+                // SAFETY: committed write-watched memory we allocated.
+                unsafe {
+                    std::slice::from_raw_parts_mut((title + off) as *mut u8, 300)
+                        .fill((p * 20 + k + 7) as u8);
+                }
+            }
+        }
+
+        // ON: budget of 2 runs is exceeded -> defers instead of requesting settle.
+        TEST_MERGE_DEFER.with(|c| c.set(Some(true)));
+        let before = MERGED_DEFER[0].load(Ordering::Relaxed);
+        let mut runs = 2;
+        assert!(
+            !shadow.merge_under_writes(title, LEN, &mut runs),
+            "ON must defer over-budget merges instead of requesting settle"
+        );
+        assert_eq!(runs, 0, "runs_left exhausted");
+        assert!(
+            MERGED_DEFER[0].load(Ordering::Relaxed) > before,
+            "deferred slices counter must increment"
+        );
+
+        // Next submission with fresh budget merges the deferred pages cleanly.
+        let mut runs = 64;
+        assert!(!shadow.merge_under_writes(title, LEN, &mut runs));
+        // SAFETY: shadow.data holds LEN bytes; title holds LEN bytes.
+        let (src, dst) = unsafe {
+            (
+                std::slice::from_raw_parts(title as *const u8, LEN),
+                std::slice::from_raw_parts(shadow.data, LEN),
+            )
+        };
+        assert_eq!(dst, src, "deferred pages must match title memory after next merge");
+        TEST_MERGE_DEFER.with(|c| c.set(None));
     }
 }
 
