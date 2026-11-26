@@ -2001,6 +2001,65 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     here
 }
 
+/// Whether [`unguard`] batches consecutive guarded blocks into one
+/// `VirtualProtect` call (PR #2849; `VICTORY_BATCH_OPEN=1`, default OFF).
+fn batch_open() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_BATCH_OPEN.with(|c| c.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_BATCH_OPEN"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `VirtualProtect` calls made by [`unguard`] on this test thread, and
+    /// an optional override for [`batch_open`].
+    static TEST_OPEN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_BATCH_OPEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Diagnostics for [`batch_open`]: batched runs (>1 block), blocks opened in
+/// batches, `VirtualProtect` calls saved, and per-block fallbacks.
+#[cfg(feature = "diagnostics")]
+static BATCH_OPEN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Per-frame proof-of-activation line for ported guard optimizations (PR #3035 / #2849).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn batch_open_stats(frames: f64) -> String {
+    let [runs, blocks, saved, fallbacks] =
+        [0, 1, 2, 3].map(|i| BATCH_OPEN[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let on = u8::from(batch_open());
+    format!(
+        "fault_copies_unlocked 0 (0.00 MB, n/a on avatarmanz); batch_open(VICTORY_BATCH_OPEN={on}) {:.1} runs, {:.1} blocks, {:.1} vp_saved, {:.1} fallbacks",
+        runs as f64 / frames,
+        blocks as f64 / frames,
+        saved as f64 / frames,
+        fallbacks as f64 / frames,
+    )
+}
+
+/// Gives write access back to one guarded block, restoring non-guard
+/// protections (e.g. code pages) if the address no longer holds ours.
+fn unguard_one(block: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: a block we made read-only.
+    unsafe {
+        if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+            && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+        {
+            // Not what we left there: the address is other memory's
+            // (code's, say), which keeps its protection.
+            VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+        }
+    }
+    #[cfg(test)]
+    TEST_OPEN_CALLS.with(|c| c.set(c.get() + 1));
+    PROTECTED.clear(block);
+}
+
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
@@ -2013,19 +2072,73 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+    if !batch_open() {
+        for &block in blocks {
+            unguard_one(block);
+        }
+    } else if !blocks.is_empty() {
+        let mut owned = Vec::new();
+        let sorted: &[usize] = if blocks.windows(2).any(|w| w[0] >= w[1]) {
+            owned.extend_from_slice(blocks);
+            owned.sort_unstable();
+            owned.dedup();
+            &owned
+        } else {
+            blocks
+        };
+        let mut i = 0;
+        while i < sorted.len() {
+            let first = sorted[i];
+            let mut last = first + 1;
+            i += 1;
+            while i < sorted.len() && sorted[i] == last {
+                last += 1;
+                i += 1;
+            }
+            let len = last - first;
+            if len == 1 {
+                unguard_one(first);
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: a contiguous run of blocks we made read-only.
+            let done = unsafe {
+                VirtualProtect((first * BLOCK) as *const _, len * BLOCK, PAGE_READWRITE, &mut old)
+            } != 0;
+            #[cfg(test)]
+            TEST_OPEN_CALLS.with(|c| c.set(c.get() + 1));
+            if done && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                for block in first..last {
+                    PROTECTED.clear(block);
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    BATCH_OPEN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    BATCH_OPEN[1].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+                    BATCH_OPEN[2].fetch_add((len - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                if done {
+                    // Unexpected protection on the first block: restore before
+                    // falling back per block so non-guard memory keeps its mode.
+                    // SAFETY: restoring the protection just replaced.
+                    unsafe {
+                        VirtualProtect((first * BLOCK) as *const _, len * BLOCK, old, &mut old);
+                    }
+                }
+                // Windows refuses one VirtualProtect across separate allocations
+                // (ERROR_INVALID_ADDRESS / 487) or uncommitted pages: restore
+                // each block individually, as the old path did.
+                for block in first..last {
+                    unguard_one(block);
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    BATCH_OPEN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    BATCH_OPEN[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
-        PROTECTED.clear(block);
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
@@ -4381,5 +4494,174 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod batch_open_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+
+    /// PR #2849: Windows refuses one `VirtualProtect` across two separate
+    /// allocations, even when the blocks are adjacent and both guarded: the
+    /// per-block fallback must still make them writable.
+    #[test]
+    fn open_runs_falls_back_across_separate_allocations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, VirtualAlloc,
+            VirtualFree,
+        };
+        // SAFETY: reserve two adjacent blocks, release, then allocate each separately.
+        let hint = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        if hint == 0 {
+            return;
+        }
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(hint as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: two separate allocations at adjacent addresses.
+        let (a, b) = unsafe {
+            (
+                VirtualAlloc(hint as *const _, BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) as usize,
+                VirtualAlloc((hint + BLOCK) as *const _, BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) as usize,
+            )
+        };
+        if a == 0 || b != a + BLOCK {
+            // SAFETY: whichever allocations succeeded are ours.
+            unsafe {
+                if a != 0 {
+                    VirtualFree(a as *mut _, 0, MEM_RELEASE);
+                }
+                if b != 0 {
+                    VirtualFree(b as *mut _, 0, MEM_RELEASE);
+                }
+            }
+            eprintln!("two adjacent separate allocations unavailable; skipped");
+            return;
+        }
+        let blocks = [a / BLOCK, b / BLOCK];
+        TEST_BATCH_OPEN.with(|c| c.set(Some(true)));
+        {
+            let mut g = guards();
+            for &block in &blocks {
+                g.protected.insert(block);
+                g.clean.insert(block);
+                PROTECTED.set(block);
+            }
+            unguard(&mut g, &blocks);
+            assert!(blocks.iter().all(|&blk| !g.protected.contains(blk)));
+        }
+        TEST_BATCH_OPEN.with(|c| c.set(None));
+        assert!(writable(a) && writable(b), "both blocks read-write after fallback");
+        // SAFETY: our allocations.
+        unsafe {
+            VirtualFree(a as *mut _, 0, MEM_RELEASE);
+            VirtualFree(b as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// PR #2849: with `VICTORY_BATCH_OPEN=1`, a bulk write over a contiguous
+    /// run of guarded view blocks opens them in one `VirtualProtect` call;
+    /// when OFF (the default), it keeps the old one-call-per-block path.
+    #[test]
+    fn a_bulk_write_opens_guarded_pages_in_one_call() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        if std::env::var_os("VICTORY_BATCH_OPEN").is_none() {
+            TEST_BATCH_OPEN.with(|c| c.set(None));
+            assert!(!batch_open(), "VICTORY_BATCH_OPEN must default OFF");
+        }
+        const BLOCKS: usize = 8;
+        // SAFETY: a pagefile section of 8 blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (BLOCKS * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCKS * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        // Batch ON -> 1 VirtualProtect call for 8 contiguous blocks.
+        assert!(guard(view, view + BLOCKS * BLOCK).is_some());
+        TEST_BATCH_OPEN.with(|c| c.set(Some(true)));
+        TEST_OPEN_CALLS.with(|c| c.set(0));
+        writing(view, BLOCKS * BLOCK);
+        assert_eq!(TEST_OPEN_CALLS.with(|c| c.get()), 1, "one call for the run");
+        for i in 0..BLOCKS {
+            assert!(writable(view + i * BLOCK), "block {i} writable again (batch ON)");
+        }
+        // Batch OFF (default old path) -> 8 VirtualProtect calls.
+        assert!(guard(view, view + BLOCKS * BLOCK).is_some());
+        TEST_BATCH_OPEN.with(|c| c.set(Some(false)));
+        TEST_OPEN_CALLS.with(|c| c.set(0));
+        writing(view, BLOCKS * BLOCK);
+        assert_eq!(TEST_OPEN_CALLS.with(|c| c.get()), BLOCKS as u64, "one call per block when OFF");
+        for i in 0..BLOCKS {
+            assert!(writable(view + i * BLOCK), "block {i} writable again (batch OFF)");
+        }
+        TEST_BATCH_OPEN.with(|c| c.set(None));
+        title_memory_unmapping(view, BLOCKS * BLOCK);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            );
+        }
+    }
+
+    /// `cargo test --release -p victory-gpu benchmark_guard_open_runs -- --ignored --test-threads=1 --nocapture`.
+    #[test]
+    #[ignore = "benchmark: one VirtualProtect per block against one per run"]
+    fn benchmark_guard_open_runs() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        const BLOCKS: usize = 512;
+        const ROUNDS: usize = 20;
+        // SAFETY: a pagefile section of 512 blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (BLOCKS * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCKS * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        for (label, batched) in [("one call per block (OFF)", false), ("one call per run (ON)", true)] {
+            TEST_BATCH_OPEN.with(|c| c.set(Some(batched)));
+            let mut calls = 0;
+            let mut elapsed = std::time::Duration::ZERO;
+            for _ in 0..ROUNDS {
+                assert!(guard(view, view + BLOCKS * BLOCK).is_some());
+                TEST_OPEN_CALLS.with(|c| c.set(0));
+                let started = std::time::Instant::now();
+                writing(view, BLOCKS * BLOCK);
+                elapsed += started.elapsed();
+                calls += TEST_OPEN_CALLS.with(|c| c.get());
+            }
+            println!("{label}: {calls} VirtualProtect calls over {ROUNDS} rounds, {elapsed:?}");
+        }
+        TEST_BATCH_OPEN.with(|c| c.set(None));
+        title_memory_unmapping(view, BLOCKS * BLOCK);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            );
+        }
     }
 }

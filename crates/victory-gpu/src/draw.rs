@@ -2729,8 +2729,11 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        {
+            let _pt = crate::pipeline_timing::begin(list, Some(p));
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(x, y, z) };
+        }
         self.buffers_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3080,12 +3083,15 @@ impl State {
                     }
                     // With the launch stage the count goes to it as a root
                     // constant (`crate::launch`).
-                    match p.and_then(|p| p.launch.as_ref()) {
-                        Some(launch) => {
-                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                    {
+                        let _pt = crate::pipeline_timing::begin(list, p);
+                        match p.and_then(|p| p.launch.as_ref()) {
+                            Some(launch) => {
+                                crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                            }
+                            // SAFETY: an open list with everything set.
+                            None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
                         }
-                        // SAFETY: an open list with everything set.
-                        None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
                     }
                     self.drew(list, p);
                     self.mesh_scissor(list, false);
@@ -3573,12 +3579,16 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawInstanced(count, instances, from, first_instance)
-            };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            let p = crate::pipeline::host_pipeline(self.pipeline as This);
+            {
+                let _pt = crate::pipeline_timing::begin(list, p);
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawInstanced(count, instances, from, first_instance)
+                };
+            }
+            self.drew(list, p);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3679,12 +3689,16 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            let p = crate::pipeline::host_pipeline(self.pipeline as This);
+            {
+                let _pt = crate::pipeline_timing::begin(list, p);
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+                };
+            }
+            self.drew(list, p);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3895,7 +3909,10 @@ impl State {
             let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
             list.keep(&args.buffer);
             self.mesh_scissor(list, true);
-            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+            let launched = {
+                let _pt = crate::pipeline_timing::begin(list, Some(p));
+                crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record))
+            };
             self.mesh_scissor(list, false);
             if !launched {
                 why("no budget for the launch");
@@ -4119,18 +4136,21 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        {
+            let _pt = crate::pipeline_timing::begin(list, Some(p));
+            // SAFETY: an open list with everything set; the scratch buffer and
+            // host copies are kept alive by the list, and the signature is cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

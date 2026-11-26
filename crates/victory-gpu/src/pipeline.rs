@@ -193,6 +193,31 @@ impl Shader {
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         victory_shader::native_programs(part.data).ok()
     }
+
+    /// Shader debug/role name from DXBC `ILDN` if present, or known ambient role.
+    pub(crate) fn role_name(&self) -> Option<String> {
+        use victory_shader::{Container, FourCC};
+        if let Ok(c) = Container::parse(&self.container)
+            && let Some(part) = c.part(FourCC::ILDN)
+            && part.data.len() >= 4
+        {
+            let len = u16::from_le_bytes([part.data[2], part.data[3]]) as usize;
+            let raw = part.data.get(4..4 + len).unwrap_or(&part.data[4..]);
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            if let Ok(s) = std::str::from_utf8(&raw[..end]) {
+                let base = s.rsplit(['/', '\\']).next().unwrap_or(s);
+                let trimmed = base.strip_suffix(".pdb").unwrap_or(base).trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_owned());
+                }
+            }
+        }
+        self.ambient.map(|r| match r {
+            crate::ambient::Role::Resolve => "CS_ScreenProbes_TemporalResolve".to_owned(),
+            crate::ambient::Role::Radiance => "CS_CacheScreenSpaceRadiance".to_owned(),
+            crate::ambient::Role::Air => "CS_AccumulateLocalLightInscatteringVolume".to_owned(),
+        })
+    }
 }
 
 #[cfg(windows)]

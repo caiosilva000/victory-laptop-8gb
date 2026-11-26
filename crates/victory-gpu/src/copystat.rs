@@ -1255,6 +1255,11 @@ pub(crate) fn log(frames: f64) {
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
     );
+    tracing::info!(
+        "ported guard/tex fast paths per frame: {}; {}",
+        crate::watch::batch_open_stats(frames as f64),
+        crate::texture::partial_detile_stats(frames as f64)
+    );
     let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(

@@ -1327,6 +1327,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_PIPELINE_TIMING=1`: per-pipeline sampled GPU timestamps.
+    pub(crate) pipeline_timing: crate::pipeline_timing::ListTiming,
 }
 
 /// Batch passes recorded into the prelude, before any title commands.
@@ -3944,6 +3946,7 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    list.pipeline_timing.land();
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
@@ -4213,6 +4216,7 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                pipeline_timing: crate::pipeline_timing::ListTiming::new(),
             })
         }
     }
@@ -6214,6 +6218,55 @@ impl Host {
     }
 }
 
+/// Creates a D3D12 timestamp query heap of `count` slots and its matching
+/// readback buffer (`count * 8` bytes).
+pub(crate) fn make_timestamp_heap(count: u32) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let device = &host()?.device;
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(count) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: count, NodeMask: 0 },
+                &mut heap,
+            )
+            .ok()?;
+        device
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
+
+/// Cached GPU timestamp frequency (ticks per second) of the direct queue.
+pub(crate) fn timestamp_frequency() -> u64 {
+    static FREQ: OnceLock<u64> = OnceLock::new();
+    *FREQ.get_or_init(|| {
+        let Some(h) = host() else { return 1 };
+        // SAFETY: a plain query on our live direct queue.
+        unsafe { h.queue.GetTimestampFrequency() }.unwrap_or(1).max(1)
+    })
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -6303,6 +6356,7 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        self.pipeline_timing.close(&self.list);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6359,6 +6413,7 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pipeline_timing.reset();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -9037,6 +9092,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        crate::pipeline_timing::maybe_log();
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {

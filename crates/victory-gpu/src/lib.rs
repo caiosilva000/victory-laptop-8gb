@@ -49,6 +49,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod pipeline_timing;
+#[cfg(windows)]
 mod picked;
 #[cfg(windows)]
 mod pool;

@@ -1078,6 +1078,71 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// Whether write-watched texture refreshes detile only the rows touched by
+/// written 64 KiB pages into the persistent staging buffer (PR #2985;
+/// `VICTORY_PARTIAL_TEX_DETILE=1`, default OFF).
+fn partial_tex_detile() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_PARTIAL_TEX_DETILE.with(|c| c.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PARTIAL_TEX_DETILE"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PARTIAL_TEX_DETILE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Diagnostics for [`partial_tex_detile`]: partial refreshes, rows detiled,
+/// total rows of those textures, title bytes read, full title bytes.
+#[cfg(feature = "diagnostics")]
+static PARTIAL_TEX: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn partial_detile_stats(frames: f64) -> String {
+    let [n, rows, total_rows, read_bytes, full_bytes] =
+        [0, 1, 2, 3, 4].map(|i| PARTIAL_TEX[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let on = u8::from(partial_tex_detile());
+    let mb = |b: u64| b as f64 / (1 << 20) as f64 / frames;
+    format!(
+        "partial_tex(VICTORY_PARTIAL_TEX_DETILE={on}) {:.1} refreshes, {:.0}/{:.0} rows, {:.2}/{:.2} MB",
+        n as f64 / frames,
+        rows as f64 / frames,
+        total_rows as f64 / frames,
+        mb(read_bytes),
+        mb(full_bytes),
+    )
+}
+
+/// Converts pages written after `since` into sorted, disjoint byte ranges
+/// relative to `[start, start + size)`.
+fn changed_byte_ranges(written: &[(usize, u64)], since: u64, start: usize, size: usize) -> Vec<(usize, usize)> {
+    let page_bytes = crate::watch::PAGE;
+    let end = start.saturating_add(size);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &(page, w) in written {
+        if w <= since {
+            continue;
+        }
+        let a = page.saturating_mul(page_bytes).max(start);
+        let b = (page + 1).saturating_mul(page_bytes).min(end);
+        if a >= b {
+            continue;
+        }
+        let (ra, rb) = (a - start, b - start);
+        if let Some(last) = ranges.last_mut()
+            && ra <= last.1
+        {
+            last.1 = last.1.max(rb);
+        } else {
+            ranges.push((ra, rb));
+        }
+    }
+    ranges
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1192,6 +1257,65 @@ impl Staging {
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
+            }
+            if partial_tex_detile() && last.asked != 0 && !self.on_demand && self.first == 0 {
+                let changed = changed_byte_ranges(&written, last.asked, start, size);
+                let mut plan: Vec<(usize, std::ops::Range<u32>, std::ops::Range<usize>)> =
+                    Vec::with_capacity(self.footprints.len());
+                let mut all_known = true;
+                for i in 0..self.footprints.len() {
+                    let (mip, slice) = self.part(i);
+                    match self.layout.touched_rows(mip, slice, &changed) {
+                        Some((rows, tiled)) => plan.push((i, rows, tiled)),
+                        None => {
+                            all_known = false;
+                            break;
+                        }
+                    }
+                }
+                if all_known {
+                    if plan.iter().all(|(_, rows, _)| rows.is_empty()) {
+                        last.asked = now;
+                        return 0;
+                    }
+                    let (bytes, ok) = with_read(size, |read| {
+                        let mut bytes = 0usize;
+                        let mut done: Vec<(usize, usize)> = Vec::new();
+                        for (_, rows, tiled) in &plan {
+                            if rows.is_empty() {
+                                continue;
+                            }
+                            let (a, b) = (tiled.start, tiled.end.min(size));
+                            if a < b && !done.contains(&(a, b)) {
+                                // SAFETY: inside `read` of the texture's size.
+                                crate::host::copy_mapped(
+                                    unsafe { read.as_mut_ptr().add(a) },
+                                    self.memory.wrapping_add(a),
+                                    b - a,
+                                    false,
+                                );
+                                bytes += b - a;
+                                done.push((a, b));
+                            }
+                        }
+                        let ok = self.detile_rows(read, &plan);
+                        (bytes, ok)
+                    });
+                    last.asked = if ok { now } else { 0 };
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let rows_detiled: u64 = plan.iter().map(|(_, r, _)| r.len() as u64).sum();
+                        let total_rows: u64 = self.rows.iter().map(|&r| u64::from(r)).sum();
+                        PARTIAL_TEX[0].fetch_add(1, Relaxed);
+                        PARTIAL_TEX[1].fetch_add(rows_detiled, Relaxed);
+                        PARTIAL_TEX[2].fetch_add(total_rows, Relaxed);
+                        PARTIAL_TEX[3].fetch_add(bytes as u64, Relaxed);
+                        PARTIAL_TEX[4].fetch_add(size as u64, Relaxed);
+                        crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
+                    }
+                    return bytes;
+                }
             }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
@@ -1457,6 +1581,47 @@ impl Staging {
                 return;
             }
         }
+    }
+
+    /// Detiles only the planned row ranges of `tiled` into the persistent
+    /// staging buffer; untouched rows keep what the staging buffer already
+    /// held from the previous detile. Returns `false` if any subresource
+    /// failed (caller resets `last.asked` so the next refresh retries whole).
+    fn detile_rows(
+        &self,
+        tiled: &[u8],
+        plan: &[(usize, std::ops::Range<u32>, std::ops::Range<usize>)],
+    ) -> bool {
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        for (i, row_range, _) in plan {
+            if row_range.is_empty() {
+                continue;
+            }
+            let i = *i;
+            let (footprint, rows) = (&self.footprints[i], self.rows[i]);
+            let (mip, slice) = self.part(i);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = (pitch * rows as usize * f.Depth as usize)
+                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+            // SAFETY: the subresource's part of the mapped staging buffer.
+            let linear = unsafe {
+                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+            };
+            if let Err(e) = self.layout.detile_rows(
+                tiled,
+                mip,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+                row_range.clone(),
+            ) {
+                tracing::warn!(?e, mip, slice, "texture rows not detiled");
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -2253,5 +2418,32 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+
+    /// PR #2985: `VICTORY_PARTIAL_TEX_DETILE` defaults OFF, and
+    /// `changed_byte_ranges` merges written 64 KiB pages into sorted disjoint
+    /// byte offsets relative to the texture start.
+    #[test]
+    fn partial_tex_detile_defaults_off_and_merges_changed_pages() {
+        use super::{TEST_PARTIAL_TEX_DETILE, changed_byte_ranges, partial_tex_detile};
+        TEST_PARTIAL_TEX_DETILE.with(|c| c.set(None));
+        if std::env::var_os("VICTORY_PARTIAL_TEX_DETILE").is_none() {
+            assert!(!partial_tex_detile(), "default must be OFF");
+        }
+        let page = crate::watch::PAGE;
+        let start = 10 * page + 1024;
+        let size = 4 * page;
+        let written = [
+            (9, 100),  // before start
+            (10, 5),   // <= since (5)
+            (11, 10),  // changed
+            (12, 12),  // adjacent changed -> merged with 11
+            (14, 15),  // partially inside end
+            (15, 20),  // past end
+        ];
+        assert_eq!(
+            changed_byte_ranges(&written, 5, start, size),
+            vec![(page - 1024, 3 * page - 1024), (4 * page - 1024, 4 * page)]
+        );
     }
 }

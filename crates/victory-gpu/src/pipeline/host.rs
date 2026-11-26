@@ -400,6 +400,8 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
     /// A mesh pipeline with the amplification stage of `crate::launch`.
     pub(crate) launch: Option<Launch>,
+    /// Cached identity for `VICTORY_PIPELINE_TIMING` (lazily populated only when on).
+    pub(crate) timing_id: std::sync::OnceLock<Arc<crate::pipeline_timing::PipelineId>>,
 }
 
 /// What a mesh pipeline with the amplification stage of `crate::launch`
@@ -759,6 +761,7 @@ impl HostPipeline {
                 rects: false,
                 state: String::new(),
                 launch: None,
+                timing_id: std::sync::OnceLock::new(),
             });
         }
         let Some(g) = g else {
@@ -874,6 +877,7 @@ impl HostPipeline {
                 rects: false,
                 state: String::new(),
                 launch,
+                timing_id: std::sync::OnceLock::new(),
             });
         }
 
@@ -990,6 +994,7 @@ impl HostPipeline {
             inputs: g.elements(),
             rects: rect_gs.is_some(),
             launch: None,
+            timing_id: std::sync::OnceLock::new(),
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
