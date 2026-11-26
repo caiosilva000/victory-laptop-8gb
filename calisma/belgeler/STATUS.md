@@ -23,6 +23,8 @@ G0h. [KARIŞIK 15:30] RIPE4 + CARD_WINDOWS_MB=1536 + PERCENT=95: pencereler İLK
 G0i. [TEŞHİS 15:45] gtw-teshis-win95: ProbeGather sabit ~1 ms/kare, yalnız sıçramalarda 26-42 ms → kalıcı darboğaz değil. Kart süresi birçok compute grubuna yayılmış. Sıradaki: wp onay çifti (150 sn) + sıradaki aday CARD_SYNC_BATCH/HOIST_CLAMPS.
 G0j. [RET 15:55] Pencereler kartta: 4 çift 150 sn, ort. −1.8 ms (146→137/147, 148→146, 138→141) → gürültü, kapalı. Sıradaki: Neon HOIST_CLAMPS portu → A/B.
 G0k. [16:15] HOIST_CLAMPS taban üstü 143→146/148→147 = sıfır test (INDIRECT_WINDOW=1 hoist'i engelliyor). Şimdi hcc/hcd: taban / WINDOW=0 / WINDOW=0+HOIST, 2 tur × 150 sn.
+G0l. [16:35] DERS: kosu.ps1 target\diag\victory.exe kullanır → her porttan sonra 'cargo build --profile diag --features diagnostics -p victory'. HOIST testleri eski ikiliyle koşmuştu; hce/hcf (taban/hoist/win0+hoist) + hcg-win0 yeni diag ile sürüyor.
+G0m. [17:05] HOIST yeni diag: taban 151/142, hoist 145/139, win0+hoist 143/138 (iki turda aynı yön, −%3-4). hch/hci 2 tur daha. win0 tek başına 3/3 açılışta çöküyor.
 GOAL (Yiğit 13:47): Sol her 3 saatte portwatch tracker.json dahil tarama (cron 6330ca1c, 16:43'ten itibaren), testler bulgulara göre.
 G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
 G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).
